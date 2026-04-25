@@ -21,7 +21,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -32,6 +32,10 @@ use garagetytus_core::SecretsStore;
 
 const SERVICE_KEY_LABEL: &str = "s3-service";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// AC8 — total wall-clock budget the post-spawn repair flow gets to
+/// wait for `garage` to become healthy before giving up. Garage
+/// usually binds within 1–2 s; 15 s leaves slack for slow disks.
+const AUTO_REPAIR_HEALTH_BUDGET: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Deserialize)]
 struct GarageConfigToml {
@@ -273,6 +277,118 @@ fn store_creds(access: &str, secret: &str) -> Result<()> {
     Ok(())
 }
 
+// ─── AC8 auto-repair (post-spawn, single-node only) ─────────
+
+/// Outcome of `auto_repair_if_single_node`. Logged via tracing;
+/// callers don't need to branch on this — it's purely diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairOutcome {
+    /// Garage came up healthy + node count == 1 + `garage repair
+    /// tables` exited 0. Counter `garagetytus_unclean_shutdown_total`
+    /// stays incremented; the table-level integrity sweep ran.
+    RepairRan,
+    /// Garage came up healthy but the cluster has >1 node. Auto-repair
+    /// was skipped because `repair tables` semantics differ across a
+    /// network partition (Q3 verdict). Operator runs manually if
+    /// needed. Carries the observed node count for logging.
+    SkippedMultiNode { nodes: usize },
+    /// Garage didn't pass the health probe within
+    /// `AUTO_REPAIR_HEALTH_BUDGET`. Repair is best-effort, never
+    /// blocks startup — this is a soft warning, not an error.
+    HealthTimeout,
+}
+
+/// AC8 — call this AFTER spawning the garage subprocess, only when
+/// `preflight_unclean_check` returned `Ok(true)`. Walks the admin API
+/// to confirm: (1) garage is healthy, (2) we're on a single-node
+/// cluster, then shells `garage repair tables` to nudge integrity.
+///
+/// Per Q3 verdict (LOPE pi+codex 2026-04-25): default-on for
+/// single-node deployments (today's v0.1 reality), auto-skipped on
+/// multi-node clusters. No flag, no operator ceremony. Failures of
+/// any step are logged and swallowed — repair never blocks serve.
+pub async fn auto_repair_if_single_node(cfg_path: &Path) -> Result<RepairOutcome> {
+    let (admin_url, admin_token) = read_admin_credentials(cfg_path)?;
+
+    if !wait_for_health(&admin_url, &admin_token, AUTO_REPAIR_HEALTH_BUDGET).await? {
+        return Ok(RepairOutcome::HealthTimeout);
+    }
+
+    let nodes = probe_node_count(&admin_url, &admin_token).await?;
+    if nodes != 1 {
+        return Ok(RepairOutcome::SkippedMultiNode { nodes });
+    }
+
+    run_repair_tables(cfg_path)?;
+    Ok(RepairOutcome::RepairRan)
+}
+
+/// Poll `health_ok` every 500 ms until it returns `Ok(true)` or
+/// `deadline` passes. Returns `Ok(false)` on timeout.
+async fn wait_for_health(
+    admin_url: &str,
+    admin_token: &str,
+    budget: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if health_ok(admin_url, admin_token).await? {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok(false)
+}
+
+/// Read `GET /v1/cluster/layout` and return the number of nodes the
+/// daemon knows about. v0.1 always returns 1 (single-node bootstrap);
+/// the multi-node guard is belt-and-suspenders for v0.5+ topologies.
+async fn probe_node_count(admin_url: &str, admin_token: &str) -> Result<usize> {
+    let client = reqwest::Client::new();
+    let layout: serde_json::Value = client
+        .get(format!("{}/v1/cluster/layout", admin_url))
+        .bearer_auth(admin_token)
+        .send()
+        .await
+        .context("GET /v1/cluster/layout (probe_node_count)")?
+        .error_for_status()?
+        .json()
+        .await
+        .context("parse layout response (probe_node_count)")?;
+    Ok(node_count_from_layout(&layout))
+}
+
+/// Pure function — extracted for unit testing on JSON fixtures.
+/// Returns `0` for malformed payloads (treated as "skip repair" by
+/// the caller, since the multi-node guard requires nodes == 1).
+fn node_count_from_layout(layout: &serde_json::Value) -> usize {
+    layout["nodes"]
+        .as_array()
+        .map(|arr| arr.len())
+        .unwrap_or(0)
+}
+
+/// Shell `garage -c <cfg> repair tables --yes`. Runs against the
+/// already-running daemon over its RPC channel. Idempotent + safe to
+/// re-run. Sub-second on small clusters.
+fn run_repair_tables(cfg_path: &Path) -> Result<()> {
+    let garage_bin = locate_garage();
+    let out = Command::new(&garage_bin)
+        .arg("-c")
+        .arg(cfg_path)
+        .args(["repair", "tables", "--yes"])
+        .output()
+        .with_context(|| format!("spawning {} repair tables", garage_bin.display()))?;
+    if !out.status.success() {
+        bail!(
+            "garage repair tables failed (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +413,62 @@ mod tests {
     #[test]
     fn parse_key_creds_errors_on_missing() {
         assert!(parse_key_creds("nothing here").is_err());
+    }
+
+    // ─── AC8 auto-repair tests ────────────────────────────
+
+    #[test]
+    fn node_count_from_layout_single_node() {
+        let layout = serde_json::json!({
+            "version": 1,
+            "nodes": [{"id": "abc123", "addr": "127.0.0.1:3901"}],
+            "roles": [{"id": "abc123", "zone": "local", "capacity": 1}]
+        });
+        assert_eq!(node_count_from_layout(&layout), 1);
+    }
+
+    #[test]
+    fn node_count_from_layout_multi_node() {
+        let layout = serde_json::json!({
+            "version": 2,
+            "nodes": [
+                {"id": "n1", "addr": "10.0.0.1:3901"},
+                {"id": "n2", "addr": "10.0.0.2:3901"},
+                {"id": "n3", "addr": "10.0.0.3:3901"},
+            ]
+        });
+        assert_eq!(node_count_from_layout(&layout), 3);
+    }
+
+    #[test]
+    fn node_count_from_layout_empty_or_missing() {
+        // Empty array → 0. Treated as "skip repair" (multi-node guard
+        // gates on == 1, so anything != 1 means skip).
+        let empty = serde_json::json!({"nodes": []});
+        assert_eq!(node_count_from_layout(&empty), 0);
+
+        // Missing field entirely → 0. Same behavior.
+        let missing = serde_json::json!({"version": 1});
+        assert_eq!(node_count_from_layout(&missing), 0);
+
+        // Wrong type (object instead of array) → 0.
+        let wrong_type = serde_json::json!({"nodes": {"a": 1}});
+        assert_eq!(node_count_from_layout(&wrong_type), 0);
+    }
+
+    #[test]
+    fn repair_outcome_variants_distinct() {
+        // Sanity: the three outcomes the auto-repair flow can produce
+        // are all distinguishable. Used by the tracing log line in
+        // start.rs to differentiate "ran", "skipped multi-node", and
+        // "health timed out".
+        let a = RepairOutcome::RepairRan;
+        let b = RepairOutcome::SkippedMultiNode { nodes: 3 };
+        let c = RepairOutcome::HealthTimeout;
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        assert_eq!(b, RepairOutcome::SkippedMultiNode { nodes: 3 });
     }
 
     #[test]

@@ -265,27 +265,25 @@ pub fn serve(_ctx: &CliContext) -> Result<i32> {
     // AC8 preflight — unclean-shutdown detection. Reads + bumps
     // the persisted counter BEFORE garage launches; the watchdog
     // tick loop inherits the value via the in-memory atomic.
+    // If the previous run crashed we'll fire a post-spawn auto-repair
+    // (see Q3 verdict: `repair tables` on single-node clusters).
     let state_dir_pre = garagetytus_core::paths::data_dir();
-    match garagetytus_watchdogs::preflight_unclean_check(&state_dir_pre) {
+    let needs_auto_repair = match garagetytus_watchdogs::preflight_unclean_check(
+        &state_dir_pre,
+    ) {
         Ok(true) => {
             eprintln!(
                 "garagetytus serve: previous run did not exit cleanly — \
                  unclean_shutdown_total incremented (see watchdog.json)."
             );
-            // garage repair invocation is an explicit follow-up
-            // polish item; the spec leaves the repair scope
-            // ambiguous (`repair tables` vs `repair start --all`)
-            // and noisy auto-repair on every restart is the wrong
-            // default. The signal is captured + visible; manual
-            // repair is the v0.1 path.
+            true
         }
-        Ok(false) => {
-            // Clean shutdown path — nothing to do.
-        }
+        Ok(false) => false,
         Err(e) => {
             tracing::warn!("preflight_unclean_check soft-failed: {}", e);
+            false
         }
-    }
+    };
 
     let garage = which_garage();
     println!(
@@ -340,6 +338,59 @@ pub fn serve(_ctx: &CliContext) -> Result<i32> {
         });
     });
 
+    // AC8 auto-repair (Q3 verdict pi+codex 2026-04-25).
+    // If preflight detected an unclean shutdown, spawn a fire-and-
+    // forget thread that waits for garage to come up healthy, probes
+    // cluster size, then shells `garage repair tables` if and only
+    // if the cluster is single-node. Skipped on multi-node clusters
+    // to avoid running a partition-sensitive repair scope by default.
+    // Failures of any step are logged + swallowed — repair never
+    // blocks startup.
+    let repair_handle = if needs_auto_repair {
+        let cfg_for_repair = cfg.clone();
+        Some(std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!("auto-repair tokio runtime: {}", e);
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                match super::bootstrap::auto_repair_if_single_node(&cfg_for_repair).await {
+                    Ok(super::bootstrap::RepairOutcome::RepairRan) => {
+                        eprintln!(
+                            "garagetytus serve: auto-repair done — \
+                             `garage repair tables` completed."
+                        );
+                    }
+                    Ok(super::bootstrap::RepairOutcome::SkippedMultiNode { nodes }) => {
+                        eprintln!(
+                            "garagetytus serve: auto-repair skipped — \
+                             cluster has {} nodes (>1). Operator runs \
+                             `garage repair tables` manually if needed.",
+                            nodes
+                        );
+                    }
+                    Ok(super::bootstrap::RepairOutcome::HealthTimeout) => {
+                        tracing::warn!(
+                            "auto-repair: garage didn't pass health probe within budget; \
+                             skipping repair tables"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("auto-repair soft-failed: {}", e);
+                    }
+                }
+            });
+        }))
+    } else {
+        None
+    };
+
     let status = Command::new(&garage)
         .args(["-c", cfg.to_str().unwrap_or(""), "server"])
         .status()?;
@@ -347,6 +398,9 @@ pub fn serve(_ctx: &CliContext) -> Result<i32> {
     shutdown.store(true, Ordering::Relaxed);
     let _ = watchdog_handle.join();
     let _ = metrics_handle.join();
+    if let Some(h) = repair_handle {
+        let _ = h.join();
+    }
 
     Ok(status.code().unwrap_or(1))
 }

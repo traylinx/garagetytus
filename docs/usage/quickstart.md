@@ -77,6 +77,42 @@ the watchdog.
 
 ```bash
 garagetytus status                # service Running / Stopped
-curl http://127.0.0.1:3903/metrics  # Prometheus text (LD#11)
+curl http://127.0.0.1:3904/metrics  # Prometheus text (LD#11, port 3904)
 cat ~/.garagetytus/watchdog.json    # JSON mirror of the metrics
+```
+
+## Recovery from unclean shutdown (AC8)
+
+`garagetytus serve` writes a sentinel file every tick. If the
+process exits without cleaning that sentinel up — `kill -9`,
+power loss, OOM kill — the next `garagetytus serve` notices,
+increments `garagetytus_unclean_shutdown_total`, then runs an
+auto-repair pass:
+
+1. Wait up to 15 s for the daemon's `/v1/health` to go green.
+2. Probe `/v1/cluster/layout` to count the cluster size.
+3. If exactly **one** node (the v0.1 default), shell
+   `garage -c <cfg> repair tables --yes` to nudge table-level
+   integrity. Sub-second on small clusters; idempotent + safe to
+   re-run.
+4. If more than one node, **skip** the auto-repair —
+   `repair tables` semantics differ across a network partition
+   and the operator should choose the scope manually.
+
+No flag, no operator ceremony. The flow logs to stderr / journal
+under `garagetytus serve:`.
+
+To check whether the last restart was clean:
+
+```bash
+curl -s http://127.0.0.1:3904/metrics | grep unclean_shutdown_total
+# garagetytus_unclean_shutdown_total <count>
+```
+
+Manual repair (multi-node clusters or when you want a heavier
+sweep):
+
+```bash
+garage -c <config-path> repair tables --yes        # safe, fast
+garage -c <config-path> repair start --all --yes   # heavier, hours
 ```

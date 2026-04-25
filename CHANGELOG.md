@@ -5,13 +5,40 @@ All notable changes to garagetytus.
 The format is based on [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/).
 
-## [v0.1.0-rc1 — code-complete, awaiting AC2/AC3/AC8 E2E run] — 2026-04-25
+## [v0.1.0-rc2 — AC8 auto-repair landed] — 2026-04-25
 
 > Status: workspace + bucket + grants + audit + rate-limit + AGPL
-> surface + install + start + bootstrap + watchdogs + CI matrix
-> all landed. **Tag v0.1.0 issued only after a clean-host
-> acceptance run** (AC2 idempotence on macOS + Linux, AC3 service
-> registration with reboot, AC8 unclean-shutdown recovery).
+> surface + install + start + bootstrap + watchdogs + CI matrix +
+> AC8 auto-repair all landed. **Tag v0.1.0 issued only after a
+> clean-host acceptance run** (AC2 idempotence on macOS + Linux,
+> AC3 service registration with reboot, AC8 unclean-shutdown
+> recovery E2E).
+
+### AC8 auto-repair (Q3 verdict — pi+codex 2026-04-25)
+
+- **`bootstrap::auto_repair_if_single_node(cfg_path)`** — async helper
+  that, when `preflight_unclean_check` reported an orphan-PID
+  sentinel, waits for garage health (15 s budget @ 500 ms poll),
+  probes cluster size via `GET /v1/cluster/layout`, and shells
+  `garage -c <cfg> repair tables --yes` iff the cluster is
+  single-node. Returns `RepairOutcome::{RepairRan,
+  SkippedMultiNode{nodes}, HealthTimeout}` for diagnostic logging.
+- **`commands/start.rs::serve`** — captures the preflight result
+  into `needs_auto_repair`; when set, spawns a fire-and-forget
+  thread (own tokio runtime) that runs the repair flow alongside
+  the existing watchdog + metrics threads. Repair never blocks
+  startup — every error path soft-fails with `tracing::warn!`.
+- **Multi-node guard** — codex's smell test pre-installed for
+  v0.5+ topologies. v0.1 always emits 1 node; the guard becomes
+  load-bearing only when multi-node clusters land.
+- **No flag, no opt-in** — pi's spec-compliance argument carried
+  ("integrity probe runs `garage repair`"). Operator surface is
+  zero; the auto-repair runs invisibly when it should and
+  auto-skips when it shouldn't.
+- **4 new unit tests** — `node_count_from_layout` on
+  single/multi/empty/missing/wrong-type fixtures + `RepairOutcome`
+  variant distinctness. Real-wire E2E deferred to AC8 acceptance
+  recipe in `verdicts/Q3-AC8-RECOVERY.md`.
 
 ### Carved from Makakoo v0.7.1
 
@@ -122,6 +149,11 @@ versions follow [SemVer](https://semver.org/).
 - **Q2** — both PASS Option A (Makakoo `bucket *` becomes a
   thin wrapper that exec's `garagetytus bucket *` with inherited
   stdio). See `Q2-VERDICT.md`.
+- **Q3** — pi=B (auto-run unconditionally), codex=C (opt-in flag).
+  Locked: B with codex's multi-node guard pre-installed —
+  default-on for single-node clusters (today's v0.1 reality),
+  auto-skipped on multi-node. No flag surface. See
+  `Q3-AC8-RECOVERY.md`.
 
 ### Companion commits on `github.com/makakoo/makakoo-os`
 
@@ -131,7 +163,9 @@ versions follow [SemVer](https://semver.org/).
 
 ### Test totals
 
-- garagetytus workspace: **92 pass, 0 fail** (44 + 5 + 35 + 8).
+- garagetytus workspace: **105 pass, 0 fail, 0 warnings**
+  (51 lib + 1 contract + 6 core + 35 grants + 12 watchdogs;
+  +4 vs rc1 from AC8 unit additions).
 - garagetytus-sdk: 15 pass, 0 fail.
 - makakoo-os workspace: 670 lib pass + 8 wrapper bin pass + 2
   pre-existing TOML failures (predate carve, reproduce on
@@ -153,13 +187,10 @@ versions follow [SemVer](https://semver.org/).
 
 - **AC8 E2E run** on a clean host (kill -9 garagetytus serve,
   restart, sentinel.lock orphan-PID detection increments
-  `unclean_shutdown_total`). The integrity probe code is in
-  place (sentinel.lock + pid_alive); the empirical
-  verification is Sebastian-side. Note: the spec also
-  references invoking `garage repair` on detected
-  unclean-shutdown — currently the watchdog reports the
-  signal but does not call repair. Repair-on-detect is a
-  follow-up polish item.
+  `unclean_shutdown_total`, auto-repair flow shells
+  `garage repair tables`). All code paths are in place;
+  empirical verification is Sebastian-side per the recipe in
+  `verdicts/Q3-AC8-RECOVERY.md`.
 - **AC3** — service registration with reboot survival on
   macOS + Linux.
 - **AC2 Linux** — Mac smoke-verified locally; Linux pending.
