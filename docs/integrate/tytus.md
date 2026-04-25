@@ -302,6 +302,163 @@ with zero tytus-side changes. The mac mints grants via
 access/secret to the pod, and the pod talks to the shim address
 just like every other Makakoo-aware pod-side workload.
 
+---
+
+## Folder ↔ bucket sync (when you want a "shared folder" UX)
+
+Three tiers, smallest to biggest, depending on how seriously you
+want offline / pod-to-pod behavior. **None of these are
+garagetytus's job** — garagetytus is the S3 wire (buckets +
+grants + daemon). The "folder ↔ bucket" relationship is a
+sync layer on top.
+
+### Tier 1 — rclone in the pod (works today, zero new code)
+
+For a single pod that wants `/app/workspace/data/` to stay
+in sync with `s3://my-bucket/work/`:
+
+```bash
+# Mac side, once: create the shared bucket + a long-lived grant.
+garagetytus bucket create pod-workspace --ttl permanent --quota 10G
+garagetytus bucket grant pod-workspace --to "tytus-pod-sync" \
+    --perms read,write,list --ttl permanent --json
+# → access_key, secret_key
+
+# Pod side, once: configure rclone with the shim endpoint.
+cat > ~/.config/rclone/rclone.conf <<EOF
+[mac-garage]
+type = s3
+provider = Other
+endpoint = http://<mac-wg-ip>:8765
+region = garage
+access_key_id = GK...
+secret_access_key = ...
+force_path_style = true
+EOF
+
+# Pod side, recurring: bidirectional sync every 60s.
+* * * * * rclone bisync /app/workspace/data mac-garage:pod-workspace/work \
+    --resync-on-first-run --conflict-resolve newer \
+    --log-file /tmp/rclone-bisync.log
+```
+
+When the mac is reachable: changes flow both ways. When the
+mac is unreachable: rclone errors, the cron tick skips, local
+writes accumulate. Next time mac comes back, the queued changes
+flush. Conflicts fall through to rclone's resolver
+(`--conflict-resolve newer` = last-writer-wins by mtime;
+`--conflict-resolve none` keeps both as `.conflict-<ts>` files).
+
+**Constraints to internalize before reaching for Tier 1:**
+
+- **Bandwidth.** Initial sync of large data over WG is slow.
+  Be explicit about the upfront cost.
+- **Eventual consistency.** Pod writes aren't visible to the
+  mac until the next sync tick. Don't position this as "shared
+  filesystem"; it's "shared eventually-consistent S3 bucket
+  with a sync helper."
+- **Pod disk cost.** A 10 GB bucket needs 10 GB of pod disk.
+  Pod plans need to budget for this.
+- **Mac-off scenarios.** When the mac is closed for hours, the
+  pod's local cache is the source of truth. Mac comes back, the
+  merge window can be large.
+
+### Tier 2 — pod-to-pod sync band-aid (caveat-heavy)
+
+If you have **two pods** and both want to share state when the
+mac is off, you can add a peer-to-peer rclone bisync between
+them — pods are on the same WG /16 so they can route to each
+other. Each pod sees three sync targets (mac, pod-A, pod-B),
+rclone reconciles whatever's reachable.
+
+**This works, but it's a band-aid.** Three-way conflicts when
+both pods edit while mac is off. Sync ordering drift — pod 1
+might learn about pod 2's change via mac before via direct, or
+vice versa. No transactional guarantees. Acceptable for shared
+notes; bad for shared model checkpoints or anything where
+ordering matters.
+
+For the rclone config + cron timer setup, the pattern is the
+same as Tier 1 — just point each pod's rclone at TWO remotes
+(mac-garage + peer-pod-NN) and run bisync against both
+periodically. The peer-pod target uses the same shim host:port
+shape, but a different mac account (you mint a separate grant
+per peer for audit clarity).
+
+If you find yourself wanting Tier 2, **that's the trigger** for
+Tier 3 — please skip the band-aid and queue the v0.5 multinode
+sprint instead. Tier 3 solves what Tier 2 papers over.
+
+### Tier 3 — multi-node Garage cluster (real fix; v0.5 sprint)
+
+The architecturally correct answer to "mac off, pods still
+work, pods can share state": run a **2-node Garage cluster**
+spanning the Mac and the Tytus control-plane droplet. Pods
+route to the droplet directly (`http://10.42.42.1:3900/`).
+When the Mac is off, the droplet keeps serving. When the Mac
+is on, Garage anti-entropy reconciles. Pure Garage native
+replication; we just wrap the bootstrap.
+
+**Topology:**
+
+```
+mac (zone="mac")  ◄──── cluster RPC (port 3901, WG) ────►  droplet (zone="droplet")
+        │                                                          │
+        │ 127.0.0.1:3900 (S3 API, mac-local)                       │ 0.0.0.0:3900 (S3 API, WG-bound, iptables-restricted to 10.42.42.0/24)
+        │                                                          │
+        └─── pod 1 (read+write via shim :8765) ──── pod 2 (read+write via :3900 direct) ┘
+                            ▲                                         ▲
+                            └── direct route to droplet over WG ──────┘
+```
+
+When mac is up: pods can use either path (shim or direct).
+When mac is off: pods use the direct path. Pod 1 writes →
+droplet replicates → pod 2 reads. **No pod-local Garage** —
+explicitly forbidden by the canonical sprint's LD#11 (would
+create N+1 cluster members, explode replication cost, couple
+data survival to pod lifecycle).
+
+**Why pod-local would be the wrong answer here.** N pods means
+N+1 cluster nodes; every write replicates N+1 times; pod
+shutdown takes data with it unless persistent volumes are
+mounted (which Tytus pods don't do today). Routing pods through
+the always-on droplet is cheaper, simpler, and survives pod
+churn for free.
+
+**Status: drafted + lope-hardened, not yet executed.**
+
+| Doc | Where |
+|---|---|
+| Wrapper sprint with carve-out deltas | `MAKAKOO/development/sprints/queued/GARAGETYTUS-V0.5-MULTINODE/SPRINT.md` |
+| Canonical 802-LOC spec (pi + qwen lope round 1 applied) | `MAKAKOO/development/sprints/queued/MAKAKOO-OS-V0.8-S3-CLUSTER/SPRINT.md` |
+| pi verdict (~11 fixes, binding-address bug among them) | `MAKAKOO-OS-V0.8-S3-CLUSTER/verdicts/LOPE-VERDICT-PI.md` |
+| qwen verdict (~13 fixes incl. ListObjects retry, presigned URL race) | `MAKAKOO-OS-V0.8-S3-CLUSTER/verdicts/LOPE-VERDICT-QWEN.md` |
+
+**Trigger to run the sprint.** Sebastian needs pod-pod sharing
+or always-on bucket access for a real workflow (not just a
+what-if). Until then, Tier 1 (mac-side single-node + rclone) is
+enough for most dev workflows.
+
+**Rough cadence.** ~9 days, one coder. Phase 0 probes (3 hours)
+gate everything else. Three new garagetytus-side design
+questions (Q4 cluster-init invocation host, Q5 multi-node
+auto-repair, Q6 cluster-wide mode derivation) need a fresh
+lope round before Phase A.
+
+### Decision matrix
+
+| Need | Reach for |
+|---|---|
+| One pod, mac usually on, dev workflow | Tier 1 (rclone) |
+| One pod, mac sometimes off for hours | Tier 1 (rclone) — local cache stays available read-only |
+| Two pods, mac always on, mostly read-shared | Tier 1 (rclone) on each pod, both targeting mac |
+| Two pods, mac sometimes off, occasional pod-pod writes | Tier 2 (rclone P2P) — accept the conflict caveats |
+| Two pods, real-time shared state, mac sometimes off | Tier 3 (v0.5 multinode sprint) — queue the sprint |
+| Production-grade always-on bucket access | Tier 3 |
+
+**Tier 3 is the goal for "real" pod-pod sharing.** Tiers 1 and
+2 are valid stops on the way there.
+
 ## Source pointers
 
 | File | What it's for |
