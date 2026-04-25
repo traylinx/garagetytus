@@ -1,0 +1,37 @@
+[package]
+name = "garagetytus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local S3 daemon for every dev laptop. Standalone Mac + Linux, powered by Garage. Windows targets v0.2."
+
+[[bin]]
+name = "garagetytus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+fs2.workspace = true
+keyring.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+garagetytus-core = { workspace = true }
+garagetytus-grants = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

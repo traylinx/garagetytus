@@ -1,0 +1,21 @@
+[package]
+name = "garagetytus-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross-platform path + keychain + StorageBackend trait for garagetytus."
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dirs.workspace = true
+keyring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
