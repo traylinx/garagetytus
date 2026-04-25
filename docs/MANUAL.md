@@ -108,13 +108,24 @@ export GARAGETYTUS_HOME=/tmp/gtx-test
 
 ## 3. Install — macOS
 
+> **v0.1.0-rc2 pre-release note.** The Homebrew tap and the
+> `garagetytus.dev/install` web bootstrap below land at the
+> v0.1.0 (non-rc) tag once cargo-dist artifacts ship. Until then,
+> use the source-build path:
+>
+> ```bash
+> brew install garage     # AGPL upstream daemon
+> git clone https://github.com/traylinx/garagetytus
+> cd garagetytus && cargo install --path crates/garagetytus
+> ```
+
 **Prereq.** Homebrew on PATH. Garage upstream ships no Mac binary,
 so we compile from source via the `garage` formula (Q1 verdict
 2026-04-25). First install takes ~3–5 min for the rust compile;
 subsequent updates are cached.
 
 ```bash
-brew install traylinx/tap/garagetytus
+brew install traylinx/tap/garagetytus       # post-cargo-dist; not yet wired
 garagetytus install
 ```
 
@@ -146,8 +157,17 @@ Then bring the daemon up — see §6.
 
 ## 4. Install — Linux
 
+> **v0.1.0-rc2 pre-release note.** Same as Mac — the
+> `garagetytus.dev/install` web bootstrap lands at the v0.1.0
+> (non-rc) tag. For now, source-build:
+>
+> ```bash
+> git clone https://github.com/traylinx/garagetytus
+> cd garagetytus && cargo install --path crates/garagetytus
+> ```
+
 ```bash
-curl -fsSL https://garagetytus.dev/install | sh
+curl -fsSL https://garagetytus.dev/install | sh    # post-cargo-dist; not yet wired
 garagetytus install
 ```
 

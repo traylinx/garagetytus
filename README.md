@@ -4,13 +4,21 @@
 > by [Garage](https://garagehq.deuxfleurs.fr/) under the hood, but
 > garagetytus owns the install + daemon lifecycle + grants surface.
 
-**Status: v0.1 in development (2026-04-25).**
+**Status: v0.1.0-rc2 (pre-release, 2026-04-25).** Source-build
+install only — Homebrew tap and `garagetytus.dev/install` web
+bootstrap land at the v0.1.0 (non-rc) tag once cargo-dist
+artifacts ship.
 
-## Install
+## Install (v0.1.0-rc2 — source build)
+
+**Prereq.** Rust 1.75+ on Mac or Linux. Garage on PATH (Mac:
+`brew install garage`; Linux: the in-binary installer downloads
+the upstream musl build + SHA-verifies).
 
 ```bash
-brew install traylinx/tap/garagetytus           # macOS
-curl -fsSL garagetytus.dev/install | sh         # Linux
+git clone https://github.com/traylinx/garagetytus
+cd garagetytus
+cargo install --path crates/garagetytus
 
 garagetytus install && garagetytus start && garagetytus bootstrap
 garagetytus bucket create my-data --ttl 7d --quota 1G
@@ -19,6 +27,17 @@ garagetytus bucket grant my-data --to "external-app" --perms read,write --ttl 1h
 
 Then any S3-compatible client points at `http://127.0.0.1:3900`:
 boto3, aws-cli, rclone, pandas, Logseq S3-sync, anything.
+
+### Future install paths (v0.1.0 final, post cargo-dist)
+
+```bash
+brew install traylinx/tap/garagetytus           # macOS  — not yet wired
+curl -fsSL garagetytus.dev/install | sh         # Linux — not yet wired
+```
+
+These ship at the v0.1.0 (non-rc) tag once the Homebrew tap and
+the `garagetytus.dev` install endpoint are published. Track in
+`CHANGELOG.md` under "Pending for v0.1.0 (non-rc) tag."
 
 **Windows targets v0.2** (lope verdict 2026-04-25 — Garage upstream
 ships no Windows binary; v0.1 budget can't carry a Windows build
@@ -98,8 +117,12 @@ garagetytus/
 
 ## License
 
-MIT. Bundled Garage is AGPL-3.0-or-later — see `THIRD_PARTY_NOTICES`
-once Phase B.5 lands.
+MIT. Bundled Garage is AGPL-3.0-or-later — see
+[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES) for upstream
+attribution + source URL + tarball SHA. The AGPL boundary is at
+the subprocess fence: Garage runs as a child process, never linked.
+Three CI gates (contract test, AGPL grep, `cargo-deny` resolver
+ban) enforce this on every PR.
 
 ## Powered by
 
