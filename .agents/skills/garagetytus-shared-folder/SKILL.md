@@ -8,24 +8,45 @@ with the user's Mac or with agents in other pods, this is how.
 
 ```bash
 . /etc/garagetytus.env
-aws s3 cp ./your-file.md s3://shared/from-pod-$(hostname)/$(basename your-file.md) \
+BUCKET=work    # ← which shared folder this file belongs in (ask if unsure)
+POD=$(hostname)
+aws s3 cp ./your-file.md s3://$BUCKET/from-$POD/$(basename your-file.md) \
     --endpoint $GARAGETYTUS_S3_ENDPOINT \
     --region garage --profile s3-service
 ```
 
-The user's Mac sees it within seconds (or as soon as the user
-runs `rclone bisync` on their shared folder). Other pods see it
-immediately via the same bucket.
+The user's Mac sees it within seconds (or as soon as `rclone
+bisync` runs against that bucket). Other pods granted access to
+the same bucket see it immediately.
+
+## One bucket = one shared folder
+
+The bucket NAME is the folder identity. Sebastian creates a
+bucket per topic (`work`, `personal`, `agent-results`, etc.) and
+binds each one to a Mac local directory via `rclone bisync`. Each
+bucket is granted to specific pods.
+
+**Discover what your pod can access:**
+
+```bash
+# Preferred — JSON manifest with intended local mount paths:
+test -f /etc/garagetytus.shared.json && cat /etc/garagetytus.shared.json
+
+# Fallback — enumerate via the S3 API:
+aws s3api list-buckets \
+    --endpoint $GARAGETYTUS_S3_ENDPOINT --profile s3-service
+```
+
+Don't write to a bucket you weren't granted, and **don't guess
+which bucket to use** — ask Sebastian if the right destination
+isn't obvious from the task. Wrong bucket = wrong audience.
 
 ## Endpoint and credentials
 
-- Endpoint: `http://10.42.42.1:3900` (per-pod stable IP — every
-  pod sees the SAME droplet S3 API at this address)
-- Bucket: `shared` (the convention; the operator may have
-  named it differently — check `/etc/garagetytus.env` or
-  ask the user)
-- Credentials: in `/etc/garagetytus.env`. Source it once at
-  agent startup.
+- Endpoint: `http://10.42.42.1:3900` (every pod sees the SAME
+  droplet S3 API at this per-pod stable IP)
+- Bucket: depends on the file. See above for discovery.
+- Credentials: in `/etc/garagetytus.env`. Source once at startup.
 
 ## Three access tools, pick what fits
 
@@ -37,13 +58,16 @@ immediately via the same bucket.
 3. **`rclone bisync`** — for keeping a pod-local directory
    mirrored to / from the bucket.
 
-## Naming convention to avoid overwrites
+## Naming convention inside a bucket
 
 Multiple parties (Mac + N pods) write to the same bucket.
 
 - Files you produce: `from-pod-<your-id>/<descriptive-name>.<ext>`
-- Files for everyone: `broadcast/<UTC-iso8601>-<short-hash>.<ext>`
+- Files for everyone in this bucket: `broadcast/<UTC-iso8601>-<short-hash>.<ext>`
 - Files from Mac to you: read from `from-mac/`
+
+The bucket itself answers "which audience" (e.g. `work` vs
+`personal`). The prefix inside the bucket answers "from whom".
 
 ## Don't put in the bucket
 

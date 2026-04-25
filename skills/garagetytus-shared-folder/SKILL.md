@@ -31,41 +31,83 @@ tags:
 
 This skill tells you, an agent running inside a tytus pod (or
 any environment with WireGuard access to the shared S3 endpoint),
-how to share files with the user and with other agents through
-the bucket on the droplet.
+how to share files with the user and with agents in other pods
+through buckets on the droplet.
 
-## Mental model
+## Mental model — one bucket = one shared folder
 
 ```
-   [your pod]            [droplet bucket]            [Mac + other pods]
-        │                       │                            │
-        │   PUT s3://shared/X   │                            │
-        ├──────────────────────►│                            │
-        │                       │      GET s3://shared/X     │
-        │                       │◄───────────────────────────┤
-        │                       │                            │
+   [your pod]                  [droplet]                    [Mac]
+        │                          │                          │
+        │  PUT s3://work/X         │  bucket: work            │
+        ├─────────────────────────►│  rclone bisync ↔         │
+        │                          │  ~/Documents/work        │
+        │                          ├─────────────────────────►│
+        │                          │                          │
+        │  PUT s3://personal/Y     │  bucket: personal        │
+        ├─────────────────────────►│  rclone bisync ↔         │
+        │                          │  ~/Documents/personal    │
+        │                          ├─────────────────────────►│
 ```
 
-The droplet runs a single-node Garage S3 daemon. Mac mounts the
-bucket via `rclone bisync` to a local folder. Pods access the
-bucket directly via the S3 API. Anything written from any party
-becomes visible to all parties immediately.
+**Each shared folder is a SEPARATE BUCKET.** The bucket name IS
+the folder identity. Sebastian creates a bucket per topic
+(`work`, `personal`, `agent-results`, etc.) and grants each one
+to specific pods. Your pod sees a bucket only if it has been
+granted access. Different files in the wrong bucket = wrong
+audience seeing them — when in doubt, **ask Sebastian which
+bucket to write to**.
+
+## Step 0 — discover which buckets your pod can use
+
+```bash
+. /etc/garagetytus.env
+
+# Preferred: read the JSON manifest if present —
+# it lists every granted bucket plus its intended local mount path:
+test -f /etc/garagetytus.shared.json && cat /etc/garagetytus.shared.json
+# Example output:
+# {
+#   "buckets": [
+#     {"name": "work",     "mount": "/app/workspace/shared/work",     "perms": "rw"},
+#     {"name": "personal", "mount": "/app/workspace/shared/personal", "perms": "ro"},
+#     {"name": "results",  "mount": "/app/workspace/shared/results",  "perms": "rw"}
+#   ]
+# }
+
+# Fallback: enumerate via the S3 API
+aws s3api list-buckets \
+    --endpoint $GARAGETYTUS_S3_ENDPOINT \
+    --profile s3-service
+```
+
+If only one bucket is granted, the rest of this skill defaults
+the bucket name to `shared` — substitute yours where it appears.
+
+## Picking the right bucket for the task
+
+| Task | Bucket |
+|---|---|
+| Drop a work-related file the user will see in `~/Documents/work` | `work` |
+| Hand off a result to another agent | `agent-results` (or whatever Sebastian uses) |
+| Broadcast to all pods | `broadcast` if granted, otherwise the all-pods bucket Sebastian named |
+| Unsure | Ask Sebastian. Don't guess. |
 
 ## Quick recipe — drop a file the user will see
 
 ```bash
-echo "Hello Sebastian, I generated this report at $(date)" \
-    > /tmp/report-$(date +%s).md
+. /etc/garagetytus.env
+BUCKET=work        # ← the bucket Sebastian wants this kind of file in
+POD=$(hostname)    # ← e.g. "wannolot-02" → tells the user which pod produced it
 
-aws s3 cp /tmp/report-$(date +%s).md s3://shared/ \
-    --endpoint http://10.42.42.1:3900 \
-    --region garage \
-    --profile s3-service
+aws s3 cp ./report.md s3://$BUCKET/from-$POD/report-$(date +%s).md \
+    --endpoint $GARAGETYTUS_S3_ENDPOINT \
+    --region garage --profile s3-service
 ```
 
-Within seconds (or after the user runs `rclone bisync` in their
-shared folder), the file appears in `~/Documents/shared-with-pods/`
-on the user's Mac.
+Within seconds (or as soon as Sebastian's `rclone bisync`
+runs against that bucket), the file appears in
+`~/Documents/$BUCKET/from-$POD/report-….md` on Mac.
 
 ## Endpoint + credentials
 

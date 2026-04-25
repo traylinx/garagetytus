@@ -535,44 +535,85 @@ aws s3 cp ./mydoc.md s3://shared/ \
     --profile s3-service
 ```
 
-### Folder-bind recipe (the Dropbox-style UX)
+### Folder-bind recipe — one bucket per shared folder
 
-`rclone bisync` mirrors a Mac directory ↔ a droplet bucket.
-Run it from cron, a launchd timer, or interactively.
-
-```bash
-# Initial setup (one-time, bootstraps state directory):
-mkdir -p ~/Documents/shared-with-pods
-rclone bisync ~/Documents/shared-with-pods garagetytus:shared --resync
-
-# Later, every N minutes (cron / launchd / fswatch loop):
-rclone bisync ~/Documents/shared-with-pods garagetytus:shared
-```
-
-For automatic sync on file change, wrap with `fswatch`:
+**The mental model: one bucket = one shared folder.** Create a
+bucket per topic, bind each one to a Mac directory, and grant
+each one to the specific pods that should see it.
 
 ```bash
-fswatch -or ~/Documents/shared-with-pods | \
-    xargs -n1 -I{} rclone bisync ~/Documents/shared-with-pods garagetytus:shared
+# 1. Create a bucket per shared folder:
+ssh root@<droplet> garagetytus bucket create work
+ssh root@<droplet> garagetytus bucket create personal
+ssh root@<droplet> garagetytus bucket create agent-results
+
+# 2. Grant each bucket to the pods that should see it:
+ssh root@<droplet> garagetytus bucket grant work --to wannolot-02 --perms read,write
+ssh root@<droplet> garagetytus bucket grant personal --to wannolot-04 --perms read,write
+ssh root@<droplet> garagetytus bucket grant agent-results --to all-pods --perms read,write
+
+# 3. On Mac, bind each bucket to a local folder via rclone bisync:
+mkdir -p ~/Documents/{work,personal,agent-results}
+rclone bisync ~/Documents/work          garagetytus:work          --resync
+rclone bisync ~/Documents/personal      garagetytus:personal      --resync
+rclone bisync ~/Documents/agent-results garagetytus:agent-results --resync
+
+# 4. For continuous sync, wrap each pair in fswatch (one per folder):
+fswatch -or ~/Documents/work | \
+    xargs -n1 -I{} rclone bisync ~/Documents/work garagetytus:work &
+fswatch -or ~/Documents/personal | \
+    xargs -n1 -I{} rclone bisync ~/Documents/personal garagetytus:personal &
 ```
 
-On pod-side, the same idea works with `inotifywait`. Or just
-`aws s3 sync` on a cron — pods don't typically need real-time
-two-way sync.
+Files written from any pod to `s3://work/…` appear in
+`~/Documents/work/` on Mac after the next bisync. Files Mac
+writes to `~/Documents/work/<file>` flow to the bucket and
+become visible to every pod with grants on `work`.
 
-### Why no `garagetytus folder bind` subcommand yet
+A pod that's not granted a bucket cannot see it — the per-bucket
+grant is the access boundary. Use this for "this folder is
+work-only", "this folder is shared with my coding agent only",
+etc.
 
-`rclone bisync` already does this well. Wrapping it in
-`garagetytus folder bind` adds maintenance burden without
-material UX gain. v0.6 may add a thin wrapper that emits the
-rclone config + a launchd plist for "drop folder, get sync"
-zero-touch UX, but the primitive already works today.
+### Pod-side discovery — `/etc/garagetytus.shared.json`
+
+For each pod, drop a JSON manifest at `/etc/garagetytus.shared.json`
+listing the buckets it has access to plus where they should
+mount inside the pod. Pod-side agents read this to know which
+bucket to use for which task:
+
+```json
+{
+  "buckets": [
+    {"name": "work",          "mount": "/app/workspace/shared/work",    "perms": "rw"},
+    {"name": "agent-results", "mount": "/app/workspace/shared/results", "perms": "rw"},
+    {"name": "personal",      "mount": "/app/workspace/shared/personal","perms": "ro"}
+  ]
+}
+```
+
+The pod-side `garagetytus-shared-folder` skill (in `skills/` and
+`.agents/skills/`) teaches agents to read this file, pick the
+right bucket per task, and use the standard naming convention
+inside each bucket (`from-<pod-id>/`, `from-mac/`, `broadcast/`).
+
+v0.5.1 ships `garagetytus folder bind` — a thin Mac-side wrapper
+that creates the bucket, grants it to a list of pods, generates
+the rclone config, drops the JSON manifest into each granted
+pod, and starts the launchd-managed continuous bisync. For now,
+the four `ssh + rclone` commands above are the manual recipe.
 
 ### Roadmap reference
 
-- v0.5.0 (this release) — shared buckets via S3 client tier, rclone bisync recipe.
-- v0.5.1 — `garagetytus cluster connect <droplet>` UX (SSH credential fetch + keychain integration).
-- v0.6 — symmetric 2-node replicated cluster (Garage netapp patch). Optional `garagetytus folder bind` wrapper if user demand surfaces.
+- v0.5.0 (this release) — shared buckets via S3 client tier;
+  manual `bucket create` + `bucket grant` + rclone bisync;
+  pod-side `garagetytus.shared.json` manifest convention.
+- v0.5.1 — `garagetytus folder bind <local-path> <bucket> --to <pods>`:
+  one command does bucket create + grants + rclone config +
+  launchd plist + per-pod manifest distribution. SSH credential
+  fetch into Mac keychain.
+- v0.6 — symmetric 2-node replicated cluster (Garage netapp
+  patch per Q10). Unblocks rf=2 HA mode if anyone needs it.
 
 ---
 
