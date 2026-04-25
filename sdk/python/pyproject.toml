@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "garagetytus-sdk"
+version = "0.1.0"
+description = "Python SDK for the garagetytus local S3 daemon."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Sebastian Schkudlara", email = "sebastian@traylinx.com" },
+]
+keywords = ["s3", "garage", "local", "object-storage", "boto3"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Archiving",
+]
+
+dependencies = [
+    "boto3>=1.28",
+    "botocore>=1.31",
+    "keyring>=24,<26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+[project.urls]
+Homepage = "https://garagetytus.dev"
+Repository = "https://github.com/traylinx/garagetytus"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
