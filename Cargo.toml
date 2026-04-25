@@ -4,6 +4,7 @@ members = [
     "crates/garagetytus",
     "crates/garagetytus-core",
     "crates/garagetytus-grants",
+    "crates/garagetytus-watchdogs",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ homepage = "https://garagetytus.dev"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
@@ -28,6 +30,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], def
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sysinfo = "0.30"
 thiserror = "2"
 tokio = { version = "1.40", features = ["full"] }
 toml = "0.8"
@@ -38,6 +41,7 @@ tempfile = "3"
 # Internal workspace crates
 garagetytus-core = { path = "crates/garagetytus-core" }
 garagetytus-grants = { path = "crates/garagetytus-grants" }
+garagetytus-watchdogs = { path = "crates/garagetytus-watchdogs" }
 
 [profile.release]
 lto = true

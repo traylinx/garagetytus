@@ -1,0 +1,22 @@
+[package]
+name = "garagetytus-watchdogs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LD#10/LD#11 — disk-watch + integrity-check + keychain-migrate watchdogs for garagetytus."
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+garagetytus-core = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

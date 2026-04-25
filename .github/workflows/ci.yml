@@ -1,0 +1,72 @@
+name: CI
+
+# Phase B.4 cross-platform matrix per Q1 verdict —
+# Mac + Linux only. Windows targets v0.2 (no upstream Garage
+# binary; no build infra in v0.1 budget).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --all-targets
+      - name: cargo test --workspace
+        run: cargo test --workspace --all-targets
+
+      - name: LD#1 contract — no garage-* crate dep
+        run: cargo test --package garagetytus --test contract_no_garage_crates
+
+  python-sdk:
+    name: pytest (garagetytus-sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./sdk/python[dev]
+      - name: pytest
+        run: pytest sdk/python/tests -v
+
+  agpl-grep:
+    name: AGPL grep — no garage source vendored
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: grep guard
+        run: |
+          set -euo pipefail
+          # LD#1 belt + suspenders — if any source line literally
+          # imports a `garage_*` Rust crate, fail loudly. The
+          # cargo-test contract handles the lockfile path; this
+          # catches editor mistakes before they hit `cargo build`.
+          if git grep -nE 'use[[:space:]]+garage_[a-z]' -- '*.rs'; then
+            echo "::error::LD#1 violation — `use garage_*` import found." >&2
+            exit 1
+          fi
+          if git grep -nE 'extern crate[[:space:]]+garage_' -- '*.rs'; then
+            echo "::error::LD#1 violation — `extern crate garage_*` found." >&2
+            exit 1
+          fi
+          echo "AGPL grep clean."

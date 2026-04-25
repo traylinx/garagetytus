@@ -51,7 +51,9 @@ use garagetytus_core::SecretsStore;
 
 const SCHEMA_VERSION: u32 = 1;
 const REGISTRY_REL: &str = "config/buckets.json";
+#[allow(dead_code)]
 const REGISTRY_LOCK_REL: &str = "config/buckets.json.lock";
+#[allow(dead_code)]
 const ADMIN_API_URL: &str = "http://127.0.0.1:3903";
 const PLUGIN: &str = "cli";
 

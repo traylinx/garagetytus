@@ -6,6 +6,12 @@
 //! resolved on demand via `garagetytus_core::paths` so the context
 //! stays lightweight.
 
+// Some accessors on CliContext are read by future Phase B
+// commands that haven't surfaced yet (admin_url / s3_url consumed
+// by health probes & metrics endpoint in v0.2). Keep them exported
+// without the dead_code warnings.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 
 use anyhow::Result;
