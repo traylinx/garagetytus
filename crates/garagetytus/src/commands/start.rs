@@ -240,6 +240,53 @@ pub fn serve(_ctx: &CliContext) -> Result<i32> {
         );
         return Ok(1);
     }
+
+    // AC4 preflight — port collision check. Garage will fail
+    // silently if any of its ports are taken, so we refuse fast
+    // with a hint pointing at the offender. Ports per the seeded
+    // config: 3900 (S3 API), 3901 (RPC), 3903 (admin). 3904 is
+    // garagetytus's own metrics port.
+    let occupied = check_required_ports();
+    if !occupied.is_empty() {
+        eprintln!("garagetytus serve: port collision — refusing to start.");
+        for (port, label) in &occupied {
+            eprintln!("  port {} ({}) is already bound", port, label);
+            if let Some(pid) = pid_holding_port(*port) {
+                eprintln!("  → likely process: pid {}", pid);
+            }
+        }
+        eprintln!(
+            "  edit `{}` to remap, or stop the colliding process.",
+            cfg.display()
+        );
+        return Ok(1);
+    }
+
+    // AC8 preflight — unclean-shutdown detection. Reads + bumps
+    // the persisted counter BEFORE garage launches; the watchdog
+    // tick loop inherits the value via the in-memory atomic.
+    let state_dir_pre = garagetytus_core::paths::data_dir();
+    match garagetytus_watchdogs::preflight_unclean_check(&state_dir_pre) {
+        Ok(true) => {
+            eprintln!(
+                "garagetytus serve: previous run did not exit cleanly — \
+                 unclean_shutdown_total incremented (see watchdog.json)."
+            );
+            // garage repair invocation is an explicit follow-up
+            // polish item; the spec leaves the repair scope
+            // ambiguous (`repair tables` vs `repair start --all`)
+            // and noisy auto-repair on every restart is the wrong
+            // default. The signal is captured + visible; manual
+            // repair is the v0.1 path.
+        }
+        Ok(false) => {
+            // Clean shutdown path — nothing to do.
+        }
+        Err(e) => {
+            tracing::warn!("preflight_unclean_check soft-failed: {}", e);
+        }
+    }
+
     let garage = which_garage();
     println!(
         "garagetytus serve: foreground daemon — `{} -c {} server` (Ctrl-C to stop)",
@@ -377,6 +424,73 @@ fn systemd_unit_path() -> std::path::PathBuf {
         .join(SERVICE_UNIT)
 }
 
+/// AC4 — TCP probe each garage port. Returns the list of ports
+/// already bound (with their human label); empty Vec means clean.
+fn check_required_ports() -> Vec<(u16, &'static str)> {
+    use std::net::TcpListener;
+    let candidates: &[(u16, &str)] = &[
+        (3900, "S3 API"),
+        (3901, "RPC"),
+        (3903, "Garage admin"),
+        (3904, "garagetytus metrics"),
+    ];
+    let mut occupied = Vec::new();
+    for &(port, label) in candidates {
+        // Attempt to bind to 127.0.0.1:<port>; if it fails with
+        // AddrInUse, the port is taken.
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(_l) => {
+                // Listener drops here, freeing the port.
+            }
+            Err(_) => occupied.push((port, label)),
+        }
+    }
+    occupied
+}
+
+/// Best-effort PID discovery for a bound port — `lsof -ti :<port>`
+/// on Mac, `ss -ltnp` parse on Linux. Returns `None` on any
+/// failure (the message just becomes less helpful but install
+/// still refuses).
+fn pid_holding_port(port: u16) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("lsof")
+            .args(["-ti", &format!(":{}", port)])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        s.lines().next()?.trim().parse().ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let out = Command::new("ss")
+            .args(["-ltnp"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        for line in s.lines() {
+            if line.contains(&format!(":{}", port)) {
+                if let Some(pid_field) = line.split("pid=").nth(1) {
+                    let pid_str: String = pid_field
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(pid) = pid_str.parse() {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = port;
+        None
+    }
+}
+
 fn which_garage() -> std::path::PathBuf {
     // Linux install.rs drops garage into ~/.local/bin; macOS installs
     // it via brew which puts it on PATH. Try the common locations,
@@ -437,5 +551,35 @@ mod tests {
         // Just exercise the const so it's not flagged dead on
         // non-windows.
         let _ = WINDOWS_DEFERRAL;
+    }
+
+    /// AC4 smoke — bind a stray listener on port 3900, verify
+    /// `check_required_ports()` reports it as occupied. Drops the
+    /// listener at end-of-test. Skips if 3900 is taken by an
+    /// unrelated process so we don't false-positive on dev hosts.
+    #[test]
+    fn check_required_ports_detects_collision() {
+        use std::net::TcpListener;
+        let bind = TcpListener::bind(("127.0.0.1", 3900));
+        if bind.is_err() {
+            // Port is already taken by something on this host —
+            // can't run the test cleanly. Skip.
+            eprintln!("skipping AC4 smoke: 3900 already in use");
+            return;
+        }
+        let _l = bind.unwrap();
+        let occupied = check_required_ports();
+        assert!(
+            occupied.iter().any(|(p, _)| *p == 3900),
+            "expected 3900 in {:?}",
+            occupied
+        );
+        drop(_l);
+        let cleared = check_required_ports();
+        assert!(
+            !cleared.iter().any(|(p, _)| *p == 3900),
+            "3900 should be free after listener dropped: {:?}",
+            cleared
+        );
     }
 }

@@ -228,6 +228,60 @@ pub fn write_watchdog_json(state_dir: &Path, state: &WatchdogState) -> Result<()
     Ok(())
 }
 
+/// AC8 preflight — runs at `garagetytus serve` startup BEFORE
+/// garage launches. If `<state-dir>/sentinel.lock` carries a PID
+/// that is no longer alive, the previous garagetytus process
+/// crashed: increment the persistent unclean-shutdown counter
+/// (mirrored in `<state-dir>/unclean_shutdown_total.txt`), log a
+/// warning, and return `Ok(true)` so the caller can decide
+/// whether to run `garage repair` before serve.
+///
+/// Returns `Ok(false)` on the clean-shutdown path (no sentinel,
+/// or sentinel PID matches a still-alive process). Errors are
+/// non-fatal — preflight always succeeds, the counter is just a
+/// best-effort signal.
+pub fn preflight_unclean_check(state_dir: &Path) -> Result<bool> {
+    std::fs::create_dir_all(state_dir).ok();
+    let sentinel = state_dir.join("sentinel.lock");
+    let counter_path = state_dir.join("unclean_shutdown_total.txt");
+
+    // Load the persisted counter into the in-memory atomic on
+    // every preflight, regardless of clean/unclean — so that
+    // tick() and /metrics report the correct historical value
+    // across process restarts.
+    let prev_total: u64 = std::fs::read_to_string(&counter_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    UNCLEAN_SHUTDOWN_TOTAL.store(prev_total, Ordering::Relaxed);
+
+    if !sentinel.exists() {
+        return Ok(false);
+    }
+    let body = match std::fs::read_to_string(&sentinel) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let prev_pid: u32 = body.trim().parse().unwrap_or(0);
+    if prev_pid == 0 || pid_alive(prev_pid) {
+        // Either malformed sentinel OR previous garagetytus is
+        // still running. Don't increment.
+        return Ok(false);
+    }
+
+    let next = prev_total + 1;
+    std::fs::write(&counter_path, next.to_string()).ok();
+    UNCLEAN_SHUTDOWN_TOTAL.store(next, Ordering::Relaxed);
+
+    tracing::warn!(
+        "garagetytus: previous run did not exit cleanly (orphan pid={} in sentinel.lock); \
+         unclean_shutdown_total now {}",
+        prev_pid,
+        next
+    );
+    Ok(true)
+}
+
 /// Read the current state from disk (for `garagetytus status`,
 /// dashboards, tytus-tray polling). Returns `Ok(None)` if the
 /// file is absent — that's the "watchdog never ran" signal.
@@ -341,5 +395,67 @@ mod tests {
         assert!(pct.is_some());
         let v = pct.unwrap();
         assert!((0.0..=100.0).contains(&v), "implausible pct: {}", v);
+    }
+
+    #[test]
+    fn preflight_unclean_check_clean_first_run() {
+        // No sentinel, no counter file → returns Ok(false), counter stays 0.
+        let tmp = tempdir().unwrap();
+        UNCLEAN_SHUTDOWN_TOTAL.store(0, Ordering::Relaxed);
+        let unclean = preflight_unclean_check(tmp.path()).unwrap();
+        assert!(!unclean);
+        assert_eq!(UNCLEAN_SHUTDOWN_TOTAL.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn preflight_unclean_check_detects_orphan_pid() {
+        let tmp = tempdir().unwrap();
+        // Seed an orphan-PID sentinel — pick a PID that's almost
+        // certainly not alive (max u32 minus 1; kernel won't have
+        // assigned this). pid=0 is filtered out as malformed,
+        // hence picking a different sentinel.
+        std::fs::write(tmp.path().join("sentinel.lock"), "999999999").unwrap();
+        UNCLEAN_SHUTDOWN_TOTAL.store(0, Ordering::Relaxed);
+        let unclean = preflight_unclean_check(tmp.path()).unwrap();
+        assert!(unclean);
+        // Counter file should now exist with value 1.
+        let body = std::fs::read_to_string(tmp.path().join("unclean_shutdown_total.txt"))
+            .unwrap();
+        assert_eq!(body.trim(), "1");
+        assert_eq!(UNCLEAN_SHUTDOWN_TOTAL.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn preflight_unclean_check_persisted_counter_is_loaded() {
+        // Even on a clean run, the persisted counter from a
+        // previous unclean shutdown must populate the in-memory
+        // atomic.
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join("unclean_shutdown_total.txt"), "7").unwrap();
+        UNCLEAN_SHUTDOWN_TOTAL.store(0, Ordering::Relaxed);
+        let unclean = preflight_unclean_check(tmp.path()).unwrap();
+        assert!(!unclean);
+        assert_eq!(UNCLEAN_SHUTDOWN_TOTAL.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn preflight_unclean_check_skips_when_sentinel_pid_alive() {
+        // Sentinel with our own PID — process is alive, no
+        // unclean-shutdown signal.
+        let tmp = tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("sentinel.lock"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        UNCLEAN_SHUTDOWN_TOTAL.store(0, Ordering::Relaxed);
+        let unclean = preflight_unclean_check(tmp.path()).unwrap();
+        assert!(!unclean);
+        assert!(!tmp.path().join("unclean_shutdown_total.txt").exists()
+            || std::fs::read_to_string(
+                tmp.path().join("unclean_shutdown_total.txt"),
+            )
+            .map(|s| s.trim() == "0")
+            .unwrap_or(true));
     }
 }
