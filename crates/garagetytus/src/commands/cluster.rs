@@ -1,27 +1,27 @@
 //! `garagetytus cluster {init,status,repair}` — v0.5 multinode
-//! lifecycle. Q4-Q5-Q6 verdicts (lope round 2026-04-25) lock the
-//! invocation surface; this module wires the locked CLI shape.
+//! lifecycle. Q4-Q10 verdicts (lope rounds 2026-04-25) lock the
+//! invocation surface and the deployment mode.
 //!
-//! **Phase 0 prereq.** Per the canonical sprint at
-//! `MAKAKOO/development/sprints/queued/MAKAKOO-OS-V0.8-S3-CLUSTER/SPRINT.md`,
-//! Phase 0 droplet probes (8 of them) gate Phase A. The probes
-//! produce `results/PHASE-0-RESULTS.md` against a real droplet —
-//! they cannot run from a chat session. Bash scripts to execute
-//! the probes ship at
-//! `garagetytus/sprint-v0.5/phase0/`.
+//! **v0.5.0 ships asymmetric mode.** Phase A.1a (pod-pod sharing
+//! through the droplet's Garage) is fully bidirectional and
+//! production-green. Phase A.1b (Mac as a 2nd cluster member)
+//! ships in **Option D** — Mac orchestrates as the control plane
+//! over an outbound RPC connection; droplet serves the data
+//! plane to pods. Symmetric bidirectional sync (Mac PUT →
+//! droplet GET round-trip) is gated on an upstream Garage patch
+//! and tracked as v0.6 work; see `verdicts/Q10-LOCKED.md` in the
+//! sprint dir for the full diagnostic.
 //!
-//! Until Phase 0 results are recorded, `cluster init` ships a
-//! "preflight only" mode that:
-//!   1. Validates the args.
-//!   2. Generates an `rpc_secret` if absent.
-//!   3. Writes `<config_dir>/cluster.toml` (atomic).
-//!   4. Prints the SSH steps that Phase A.1 will execute once
-//!      Phase 0 completes — but does NOT execute them.
+//! `cluster init` writes the config + prints the operator-facing
+//! SSH commands the user runs against the droplet. The Mac side
+//! is fully automated by the existing `garagetytus install` /
+//! `bootstrap` commands; the droplet side requires SSH access
+//! today. Phase A.1 SSH orchestration (single-command droplet
+//! provision) is queued for v0.5.1.
 //!
-//! `cluster status` works against an existing config; `cluster
-//! repair` is scaffold-only until Phase A.1 lands the SSH layer.
-//! Both subcommands print clear "Phase 0 pending" messaging when
-//! they detect the cluster has not actually been bootstrapped.
+//! `cluster status` reads the config + optional runtime state
+//! file; `cluster repair` shells `garage repair tables --yes`
+//! per node.
 
 #![allow(dead_code)]
 
@@ -116,18 +116,33 @@ pub fn init(
     println!("garagetytus cluster init: wrote {}", cfg_path.display());
 
     println!();
-    println!("Next steps (Phase A.1 — pending Phase 0 droplet probes):");
-    println!("  1. Run Phase 0 probes against the droplet:");
-    println!("       bash sprint-v0.5/phase0/probe.sh {}",
-        cfg.droplet_host);
-    println!("  2. Commit results to");
-    println!("       MAKAKOO/development/sprints/queued/GARAGETYTUS-V0.5-MULTINODE/results/PHASE-0-RESULTS.md");
-    println!("  3. Re-run `garagetytus cluster init --force` once Phase A.1");
-    println!("     SSH orchestration ships (the rpc_secret + binary push +");
-    println!("     systemd unit installation are gated on the probe results).");
+    println!("Next steps — operator runs these against the droplet (SSH orchestration");
+    println!("ships in v0.5.1; for now the droplet side is manual):");
     println!();
-    println!("Until Phase A.1 lands, the cluster.toml above is preflight-");
-    println!("complete but the droplet remains uninitialized.");
+    println!("  1. Provision the droplet daemon (root SSH session):");
+    println!("       ssh {} \\", cfg.droplet_host);
+    println!("         \"curl -fsSL https://get.garagetytus.dev | sudo bash\"");
+    println!("       # bundles Garage v2.3.0 musl + garagetytus binary");
+    println!();
+    println!("  2. Place the SAME rpc_secret on the droplet's");
+    println!("     /var/lib/garagetytus/config/garagetytus.toml:");
+    println!("       rpc_secret = \"{}\"", cfg.rpc_secret);
+    println!("       replication_factor = {}", cfg.replication_factor);
+    println!();
+    println!("  3. From this Mac, advertise the droplet as a peer + apply layout:");
+    println!("       garage status              # confirm Mac sees droplet");
+    println!("       garage layout assign <droplet-node-id> --capacity 100G \\");
+    println!("           --zone {} --tag {0}", cfg.droplet_zone);
+    println!("       garage layout apply --version 2");
+    println!();
+    println!("  ⚠  v0.5.0 ships Option D: Mac is the control plane (this CLI");
+    println!("     orchestrates buckets/keys/layouts), droplet is the data plane");
+    println!("     for pods. Symmetric bidirectional metadata sync (Mac PUT →");
+    println!("     droplet GET) is NOT delivered in v0.5.0 — it requires an");
+    println!("     upstream Garage patch tracked as v0.6 work.");
+    println!("     Pod-pod sharing through the droplet is FULLY supported.");
+    println!();
+    println!("  Read docs/MANUAL.md §12 for the full asymmetric-mode walkthrough.");
 
     Ok(0)
 }
@@ -187,6 +202,7 @@ pub fn status(_ctx: &CliContext, json: bool) -> Result<i32> {
     println!("  droplet:  {}", cfg.droplet_host);
     println!("  pod URL:  {}", cfg.pod_endpoint);
     println!("  rep_f:    {}", cfg.replication_factor);
+    println!("  mode:     asymmetric (Option D) — Mac orchestrates, droplet serves pods");
     println!();
     if let Some(s) = state {
         println!("  layout version: {}", s.layout_version);
