@@ -39,13 +39,61 @@ with:
 
 Garage stays a child process. Never linked. AGPL boundary clean.
 
+## Documentation
+
+- **[`docs/MANUAL.md`](docs/MANUAL.md)** — end-to-end operator
+  manual. Architecture, install on Mac/Linux, bootstrap, bucket
+  + grant lifecycle, observability, recovery from unclean
+  shutdown, configuration reference, uninstall, AGPL posture.
+  Read this end-to-end the first time.
+- [`docs/usage/quickstart.md`](docs/usage/quickstart.md) —
+  five-minute primer.
+- [`docs/usage/grants.md`](docs/usage/grants.md) — grant grammar
+  reference.
+- [`docs/install/{macos,linux,windows}.md`](docs/install/) —
+  per-OS install notes.
+- [`docs/integrate/{makakoo,tytus,external-app}.md`](docs/integrate/)
+  — integration contracts.
+
+## Agent skills
+
+Each `skills/<name>/SKILL.md` is an agent-readable decision tree
+covering one workflow. Any AI CLI (Claude / Gemini / Codex / pi /
+…) can be told **"install garagetytus"** or **"the daemon won't
+start"** and will follow the matching skill autonomously.
+
+- [`skills/garagetytus-install/`](skills/garagetytus-install/SKILL.md)
+  — fresh-host install on Mac or Linux. Prereq detection, error
+  recovery, post-install verification.
+- [`skills/garagetytus-bootstrap/`](skills/garagetytus-bootstrap/SKILL.md)
+  — first-run bootstrap (admin-API layout + service keypair).
+- [`skills/garagetytus-daily-ops/`](skills/garagetytus-daily-ops/SKILL.md)
+  — start/stop/restart, bucket + grant lifecycle, metrics +
+  watchdog, unclean-shutdown recovery.
+- [`skills/garagetytus-troubleshoot/`](skills/garagetytus-troubleshoot/SKILL.md)
+  — symptom → cause → fix matrix for every failure mode in
+  install, bootstrap, lifecycle, and S3-client integration.
+
+For Makakoo users, `makakoo plugin install
+git+https://github.com/traylinx/garagetytus.git` makes these
+skills discoverable via `skill_discover` automatically.
+
 ## Repo layout
 
 ```
 garagetytus/
 ├── crates/
-│   └── garagetytus-grants/    # user-grants store (carved 2026-04-25)
-└── (more lands during Phase A.1–F)
+│   ├── garagetytus/            # CLI binary
+│   ├── garagetytus-core/       # paths · keychain · backend trait (LD#13)
+│   ├── garagetytus-grants/     # user-grants · rate-limit · audit
+│   └── garagetytus-watchdogs/  # disk · integrity · keychain-migrate
+├── sdk/python/                 # garagetytus-sdk pip package
+├── docs/                       # manual + per-OS + integration
+├── skills/                     # agent-facing SKILL.md decision trees
+├── install/                    # install.sh / install.ps1 / homebrew formula
+├── deny.toml                   # cargo-deny gate (LD#1 + license allowlist)
+├── versions.toml               # per-target Garage upstream SHA pins
+└── THIRD_PARTY_NOTICES         # Garage AGPL attribution
 ```
 
 ## License
