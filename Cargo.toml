@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/garagetytus-grants"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Sebastian Schkudlara <sebastian@traylinx.com>"]
+license = "MIT"
+repository = "https://github.com/traylinx/garagetytus"
+homepage = "https://garagetytus.dev"
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
+rand = "0.8"
+regex = "1.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
