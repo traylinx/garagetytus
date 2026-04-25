@@ -24,7 +24,7 @@ end-to-end the first time; bookmark §11 (troubleshooting) and §13
 9. [Observability — `/metrics` + `watchdog.json`](#9-observability--metrics--watchdogjson)
 10. [Recovery from unclean shutdown (AC8)](#10-recovery-from-unclean-shutdown-ac8)
 11. [Troubleshooting matrix](#11-troubleshooting-matrix)
-12. [Multi-node clusters (asymmetric mode, v0.5.0)](#12-multi-node-clusters-asymmetric-mode-v050)
+12. [Shared folders across Mac + tytus pods (v0.5.0)](#12-shared-folders-across-mac--tytus-pods-v050)
 13. [Integrating with Makakoo + tytus + your own app](#13-integrating-with-makakoo--tytus--your-own-app)
 14. [Configuration reference](#14-configuration-reference)
 15. [Uninstall](#15-uninstall)
@@ -436,144 +436,143 @@ of `<log_dir>/garagetytus.log`.
 
 ---
 
-## 12. Multi-node clusters (asymmetric mode, v0.5.0)
+## 12. Shared folders across Mac + tytus pods (v0.5.0)
 
-> **Headline.** v0.5.0 ships pod-pod sharing through one droplet
-> Garage (Phase A.1a, fully bidirectional). Joining a Mac as a
-> 2-node cluster member ships in **Option D** — Mac is the
-> **control plane**, droplet is the **data plane** for pods.
-> Mac PUT → droplet GET data-plane round-trip is NOT supported
-> in v0.5.0 — it requires an upstream Garage patch tracked as
-> v0.6 work.
+> **Headline.** v0.5.0 ships **shared S3 buckets across Mac
+> and any tytus pod**, with `rclone bisync` as the
+> reference folder-sync wrapper. The droplet runs single-node
+> Garage (rf=1); Mac and pods are S3 *clients* over WireGuard.
+> Mac↔pod file round-trip is verified end-to-end.
 
 ### What works in v0.5.0
 
 | Surface | State |
 |---|---|
-| Pod ↔ pod through droplet's bucket | ✅ fully bidirectional |
-| Mac CLI orchestrates cluster (bucket/key/layout) | ✅ via `garage --rpc-host <droplet-node-id>@10.42.42.1:3901` |
-| Mac sees both nodes HEALTHY | ✅ in `garage status` |
-| Mac PUT → droplet GET (data-plane round-trip) | ❌ blocked on Garage netapp connection deduplication; see Q10 |
-| Droplet serves S3 to pods unchanged | ✅ Phase A.1a path is untouched |
+| Pod ↔ pod via the droplet's bucket | ✅ verified PUT/LIST/GET |
+| Mac ↔ droplet's bucket (Mac is S3 client over WG) | ✅ verified PUT/GET |
+| Mac ↔ pod folder sync (drop a file in Mac, pod sees it) | ✅ via `rclone bisync` |
+| `garagetytus bucket create / grant` orchestration | ✅ via Mac's `garage --rpc-host …` against droplet daemon |
 
-### Why Option D and not full bidirectional sync
-
-Garage's `netapp` peer-state machine requires each side to issue
-its own client TCP to the other. When Mac initiates outbound to
-droplet, droplet's accept loop logs `Accepted connection from
-c6480cc8...` at netapp level — but droplet's higher peering
-layer does not promote that accepted inbound to `Connected`
-state. Sync workers consult peering state, so they refuse to
-issue queries through the inbound connection. Droplet also
-cannot establish its own outbound to Mac, because Mac's accept
-loop silently closes inbound connections from a peer it already
-has an outbound to (connection deduplication by node-id). The
-result is asymmetric peering: Mac knows droplet, droplet does
-not know Mac.
-
-This is a Garage architectural constraint, not a network or
-security issue. Symmetric clustering across NAT/WG topologies
-(where one peer can only initiate from inside a netns sidecar)
-needs an upstream patch + likely a small fork. Tracked at
-v0.6 backlog; reach out to Garage maintainers if you have
-ideas for a clean path forward.
-
-### Deployment topology
+### Architecture — the simple version
 
 ```
 ┌──────────────┐                        ┌────────────────────┐
-│     Mac      │                        │   Droplet (root)   │
+│     Mac      │                        │   Droplet          │
 │              │                        │                    │
-│ garagetytus  │ Mac→droplet            │   wannolot-01      │
-│  daemon      ├──────RPC client────────►│  (per-pod sidecar) │
-│              │  rpc_secret + WG       │  ┌──────────────┐  │
-│ garage CLI   │                        │  │ garagetytus  │  │
-│ orchestrates │                        │  │  daemon      │  │
-│ everything   │                        │  │ (in netns)   │  │
-└──────────────┘                        │  └──────┬───────┘  │
-                                        │         │          │
-                                        │  ┌──────▼──────┐   │
-                                        │  │ pod-02..N    │   │
-                                        │  │ pod-side Q7  │   │
-                                        │  │ socat        │   │
-                                        │  └─────────────┘   │
+│  rclone /    │ HTTPS over             │   wannolot-01 sidecar
+│  boto3 / aws ├────WireGuard tunnel────┤  (Garage in this   │
+│  CLI / Python│  (10.42.42.1:3900)     │   netns via nsenter)│
+│              │                        │                    │
+│              │                        │   ┌──────────────┐ │
+└──────────────┘                        │   │ pods 02..20  │ │
+                                        │   │ same bucket  │ │
+                                        │   │ via Q7 socat │ │
+                                        │   └──────────────┘ │
                                         └────────────────────┘
 ```
 
-- Mac's daemon binds `0.0.0.0:3901` for RPC, advertises
-  `rpc_public_addr = 10.18.1.2:3901` (Mac's WG IP).
-- Droplet's daemon runs **inside `wannolot-01`'s network
-  namespace** via `nsenter` in the systemd unit. wannolot-01
-  has direct WG routes to both `10.42.42.1` (per-pod stable
-  IP) and `10.18.1.2` (Mac via WG). No forwarders needed.
-- Pod-side traffic (port 3900, S3 API) reaches droplet's
-  Garage via the existing socat forwarder pattern:
-  `pod:3900 → wannolot-01:3900` via `nsenter` chain. See
-  `setup-pod-proxy.sh` in `wannolot-infrastructure`.
+- **One bucket on the droplet** is the source of truth for all
+  parties. Mac, pod-02, pod-04 all read/write the same keys.
+- **Mac doesn't need to run a daemon for sharing.** Mac's
+  garagetytus daemon is for *Mac-local* buckets only (data that
+  never leaves the laptop). Sharing with pods uses the droplet
+  bucket directly via WG.
+- **Garage on the droplet runs inside `wannolot-01`'s netns**
+  via `nsenter` in the systemd unit. wannolot-01's wg0 has
+  `10.42.42.1/32` aliased; both Mac (via the WG tunnel) and
+  pods (via the per-pod Q7 socat forwarder) reach Garage on
+  this address.
+- **Single-node Garage (rf=1).** No cluster peering. The
+  v0.6 backlog includes 2-node replicated clusters via an
+  upstream Garage patch (see Q10 in the sprint dir).
 
-### Mac-side install
-
-Standard:
+### Mac side — install and configure rclone
 
 ```bash
-curl -fsSL https://get.garagetytus.dev | bash    # or brew tap
-garagetytus install
-garagetytus bootstrap
-garagetytus cluster init --droplet-host root@<your-droplet>
+brew install rclone garagetytus      # rclone for sync, garagetytus for local buckets
+
+# Drop a config file pointing at the droplet's S3 endpoint:
+cat > ~/.config/rclone/rclone.conf <<EOF
+[garagetytus]
+type = s3
+provider = Other
+access_key_id = $(security find-generic-password -s garagetytus-cluster -a s3-service -w | jq -r .access_key)
+secret_access_key = $(security find-generic-password -s garagetytus-cluster -a s3-service -w | jq -r .secret_key)
+endpoint = http://10.42.42.1:3900
+region = garage
+EOF
 ```
 
-### Droplet-side install (manual until v0.5.1 SSH orchestration lands)
+Replace the keychain lookups with explicit values until v0.5.1
+ships the `garagetytus cluster connect <droplet>` UX that
+fetches credentials over SSH and stores them in the keychain.
+
+### Droplet side — install once
 
 ```bash
 ssh root@<droplet> "curl -fsSL https://get.garagetytus.dev | sudo bash"
+ssh root@<droplet> "systemctl enable --now garagetytus.service"
 
-# Then on the droplet:
-sudo systemctl enable --now garagetytus.service
-# garagetytus.service ExecStart uses:
-#   nsenter -t $(docker inspect -f '{{.State.Pid}}' wannolot-01) -n \
-#       /root/.local/bin/garage server -c /var/lib/garagetytus/config/garagetytus.toml
-# rpc_secret in the toml MUST match Mac's cluster.toml.
-
-# Patch the existing pod proxy script to bridge pod:3900 to
-# wannolot-01:3900 (one socat per pod):
-sudo vi /opt/wannolot-infrastructure/setup-pod-proxy.sh
-# In the per-pod loop, change inner nsenter to target wannolot-01:
-#   EXEC:"nsenter -t $(docker inspect -f '{{.State.Pid}}' wannolot-01) -n socat ..."
-sudo systemctl restart wannolot-network.service
+# Bucket + key already provisioned during garagetytus bootstrap. Verify:
+ssh root@<droplet> "garagetytus bucket list"
+ssh root@<droplet> "garagetytus bucket grant my-data --to laptop --perms read,write"
 ```
 
-### Operating in Option D
+The systemd unit's `ExecStart` uses
+`nsenter -t $(docker inspect -f '{{.State.Pid}}' wannolot-01) -n` so Garage
+binds inside the sidecar's netns where `10.42.42.1/32` lives.
 
-From the Mac, run cluster operations through the working
-outbound RPC connection:
+### Pod side — automatic
+
+Tytus pods get S3 access via the existing `setup-pod-proxy.sh`
+forwarder chain. Inside any pod:
 
 ```bash
-# From the Mac (control plane):
-DROPLET_NODE_ID=$(ssh root@<droplet> "garagetytus admin --json | jq -r .node_id")
-
-garage --rpc-host "$DROPLET_NODE_ID@10.42.42.1:3901" status
-garage --rpc-host "$DROPLET_NODE_ID@10.42.42.1:3901" \
-    layout assign "$DROPLET_NODE_ID" --capacity 100G --zone droplet --tag droplet
-garage --rpc-host "$DROPLET_NODE_ID@10.42.42.1:3901" layout apply --version 2
-
-garage --rpc-host "$DROPLET_NODE_ID@10.42.42.1:3901" bucket create my-data
-garage --rpc-host "$DROPLET_NODE_ID@10.42.42.1:3901" key create s3-service
-garage --rpc-host "$DROPLET_NODE_ID@10.42.42.1:3901" \
-    bucket allow my-data --read --write --key s3-service
+# Pod's existing s3-service credentials in /etc/garagetytus.env
+aws s3 cp ./mydoc.md s3://shared/ \
+    --endpoint http://10.42.42.1:3900 \
+    --region garage \
+    --profile s3-service
 ```
 
-The droplet ships the data plane to pods. Pods PUT/GET via the
-S3 API at `http://10.42.42.1:3900/` with the keypair Mac
-created. Pod-pod sharing flows through the droplet's bucket as
-the source of truth.
+### Folder-bind recipe (the Dropbox-style UX)
 
-### Migration to v0.6 (when symmetric peering ships)
+`rclone bisync` mirrors a Mac directory ↔ a droplet bucket.
+Run it from cron, a launchd timer, or interactively.
 
-The cluster.toml format and rpc_secret survive the upgrade.
-v0.6 will add a `garagetytus cluster sync-enable` command that
-flips the daemon to use the upstream Garage symmetric-peering
-patch + adds a Phase A.1b acceptance test for the
-PUT-Mac → GET-droplet round-trip. No breaking changes.
+```bash
+# Initial setup (one-time, bootstraps state directory):
+mkdir -p ~/Documents/shared-with-pods
+rclone bisync ~/Documents/shared-with-pods garagetytus:shared --resync
+
+# Later, every N minutes (cron / launchd / fswatch loop):
+rclone bisync ~/Documents/shared-with-pods garagetytus:shared
+```
+
+For automatic sync on file change, wrap with `fswatch`:
+
+```bash
+fswatch -or ~/Documents/shared-with-pods | \
+    xargs -n1 -I{} rclone bisync ~/Documents/shared-with-pods garagetytus:shared
+```
+
+On pod-side, the same idea works with `inotifywait`. Or just
+`aws s3 sync` on a cron — pods don't typically need real-time
+two-way sync.
+
+### Why no `garagetytus folder bind` subcommand yet
+
+`rclone bisync` already does this well. Wrapping it in
+`garagetytus folder bind` adds maintenance burden without
+material UX gain. v0.6 may add a thin wrapper that emits the
+rclone config + a launchd plist for "drop folder, get sync"
+zero-touch UX, but the primitive already works today.
+
+### Roadmap reference
+
+- v0.5.0 (this release) — shared buckets via S3 client tier, rclone bisync recipe.
+- v0.5.1 — `garagetytus cluster connect <droplet>` UX (SSH credential fetch + keychain integration).
+- v0.6 — symmetric 2-node replicated cluster (Garage netapp patch). Optional `garagetytus folder bind` wrapper if user demand surfaces.
 
 ---
 

@@ -116,33 +116,34 @@ pub fn init(
     println!("garagetytus cluster init: wrote {}", cfg_path.display());
 
     println!();
-    println!("Next steps — operator runs these against the droplet (SSH orchestration");
-    println!("ships in v0.5.1; for now the droplet side is manual):");
+    println!("Next steps (v0.5.0 ships shared buckets via S3 client tier; SSH");
+    println!("orchestration of these steps lands in v0.5.1):");
     println!();
-    println!("  1. Provision the droplet daemon (root SSH session):");
+    println!("  1. Provision the droplet daemon:");
     println!("       ssh {} \\", cfg.droplet_host);
     println!("         \"curl -fsSL https://get.garagetytus.dev | sudo bash\"");
-    println!("       # bundles Garage v2.3.0 musl + garagetytus binary");
     println!();
-    println!("  2. Place the SAME rpc_secret on the droplet's");
-    println!("     /var/lib/garagetytus/config/garagetytus.toml:");
-    println!("       rpc_secret = \"{}\"", cfg.rpc_secret);
-    println!("       replication_factor = {}", cfg.replication_factor);
+    println!("  2. Bootstrap a bucket + key on the droplet:");
+    println!("       ssh {} \"garagetytus bootstrap\"", cfg.droplet_host);
+    println!("       ssh {} \"garagetytus bucket grant shared --to mac --perms read,write\"",
+        cfg.droplet_host);
     println!();
-    println!("  3. From this Mac, advertise the droplet as a peer + apply layout:");
-    println!("       garage status              # confirm Mac sees droplet");
-    println!("       garage layout assign <droplet-node-id> --capacity 100G \\");
-    println!("           --zone {} --tag {0}", cfg.droplet_zone);
-    println!("       garage layout apply --version 2");
+    println!("  3. On this Mac, configure rclone (or boto3 / aws CLI) against:");
+    println!("       endpoint = http://10.42.42.1:3900   # WG-tunneled, droplet's S3 API");
+    println!("       region   = garage");
+    println!("       (access/secret from `ssh {} 'garagetytus bucket grant shared ...'`)",
+        cfg.droplet_host);
     println!();
-    println!("  ⚠  v0.5.0 ships Option D: Mac is the control plane (this CLI");
-    println!("     orchestrates buckets/keys/layouts), droplet is the data plane");
-    println!("     for pods. Symmetric bidirectional metadata sync (Mac PUT →");
-    println!("     droplet GET) is NOT delivered in v0.5.0 — it requires an");
-    println!("     upstream Garage patch tracked as v0.6 work.");
-    println!("     Pod-pod sharing through the droplet is FULLY supported.");
+    println!("  4. rclone bisync mirrors a folder ↔ bucket:");
+    println!("       rclone bisync ~/Documents/shared garagetytus:shared --resync");
     println!();
-    println!("  Read docs/MANUAL.md §12 for the full asymmetric-mode walkthrough.");
+    println!("  Mac and any tytus pod can PUT/GET the same bucket — that's the");
+    println!("  v0.5.0 \"shared folders\" delivery. Read docs/MANUAL.md §12 for");
+    println!("  the full walkthrough including launchd timer + fswatch loop.");
+    println!();
+    println!("  Note: 2-node Garage cluster replication (rf=2 with Mac as a");
+    println!("  storage member) is deferred to v0.6 — see verdicts/Q10-LOCKED.md");
+    println!("  in the sprint dir for the upstream Garage patch dependency.");
 
     Ok(0)
 }
@@ -202,7 +203,7 @@ pub fn status(_ctx: &CliContext, json: bool) -> Result<i32> {
     println!("  droplet:  {}", cfg.droplet_host);
     println!("  pod URL:  {}", cfg.pod_endpoint);
     println!("  rep_f:    {}", cfg.replication_factor);
-    println!("  mode:     asymmetric (Option D) — Mac orchestrates, droplet serves pods");
+    println!("  mode:     S3-client tier (v0.5.0) — Mac + pods share droplet's bucket");
     println!();
     if let Some(s) = state {
         println!("  layout version: {}", s.layout_version);
