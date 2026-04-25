@@ -56,6 +56,11 @@ versions follow [SemVer](https://semver.org/).
   Linux path downloads upstream musl binary, SHA-verifies,
   generates systemd-user unit; Windows prints v0.2 deferral.
   Idempotent (AC2).
+- `garagetytus uninstall [--keep-data]` — stops daemon (best-
+  effort), removes plist / systemd unit, deletes `s3-service`
+  keychain entry, removes config + logs (and data unless
+  `--keep-data`). Idempotent — second invocation is a no-op
+  (AC2 full).
 - `garagetytus start / stop / status / restart / serve` —
   `launchctl bootstrap/bootout` (Mac) + `systemctl --user`
   (Linux). `serve` runs garage in foreground + spawns the
@@ -132,13 +137,34 @@ versions follow [SemVer](https://semver.org/).
   pre-existing TOML failures (predate carve, reproduce on
   pristine HEAD).
 
+### Locally smoke-verified (this session, Mac)
+
+- **AC2 install/uninstall idempotence** ✅ — two install +
+  two uninstall round-trips on `GARAGETYTUS_HOME=/tmp/...`,
+  config tokens preserved, second uninstall no-op'd.
+- **AC6 per-OS path conventions** ✅ — env override routes
+  config/data/logs to `/tmp/...`; plist correctly lands in
+  `~/Library/LaunchAgents/` (OS-mandated location).
+- **AC11 AGPL surface** ✅ — `garagetytus about` prints
+  bundled Garage version, upstream source URL, license,
+  tarball SHA verbatim.
+
 ### Pending for v0.1.0 (non-rc) tag
 
-- **AC8 E2E run** on a clean host (kill garage with SIGKILL,
-  restart, integrity probe writes incremented counter, daemon
-  serves again).
-- **AC2 / AC3 acceptance** — real install + uninstall +
-  reboot-survival run on macOS + Linux.
+- **AC8 E2E run** on a clean host (kill -9 garagetytus serve,
+  restart, sentinel.lock orphan-PID detection increments
+  `unclean_shutdown_total`). The integrity probe code is in
+  place (sentinel.lock + pid_alive); the empirical
+  verification is Sebastian-side. Note: the spec also
+  references invoking `garage repair` on detected
+  unclean-shutdown — currently the watchdog reports the
+  signal but does not call repair. Repair-on-detect is a
+  follow-up polish item.
+- **AC3** — service registration with reboot survival on
+  macOS + Linux.
+- **AC2 Linux** — Mac smoke-verified locally; Linux pending.
+- **AC4 / AC5 / AC7 / AC9 / AC10 / AC12** — require
+  bootstrapped running daemon + (in some cases) Linux box.
 - **Phase C.3 Makakoo Python re-export flip** — gated on
   PyPI publish (codex consumption-boundary contract).
 - **Phase E (tytus team)** — separate repo, contract is in
