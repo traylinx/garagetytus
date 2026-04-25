@@ -50,6 +50,18 @@ pub fn config_dir() -> PathBuf {
         .join(APP_NAME)
 }
 
+/// LD#9 — canonical grants-file location. garagetytus is the sole
+/// writer; Makakoo + tytus consume read-only via the same path.
+/// Resolved through `dirs::config_dir()` (NOT shell `~`-expansion)
+/// so Windows lands at `%APPDATA%\garagetytus\grants.json`,
+/// macOS at `~/Library/Application Support/garagetytus/grants.json`,
+/// Linux at `$XDG_CONFIG_HOME/garagetytus/grants.json`.
+/// `GARAGETYTUS_HOME` override collapses to
+/// `<override>/config/grants.json`.
+pub fn grants_path() -> PathBuf {
+    config_dir().join("grants.json")
+}
+
 /// Platform-appropriate log directory.
 pub fn log_dir() -> PathBuf {
     if let Ok(p) = std::env::var(GARAGETYTUS_HOME_ENV) {
@@ -100,5 +112,21 @@ mod tests {
         assert!(l.ends_with(APP_NAME) && l.to_string_lossy().contains("Library/Logs"));
         #[cfg(not(target_os = "macos"))]
         assert!(l.starts_with(d.parent().unwrap()));
+    }
+
+    #[test]
+    fn grants_path_lands_in_config_dir() {
+        // LD#9 — grants.json must live under config_dir(),
+        // honoring the GARAGETYTUS_HOME override.
+        let _g = LOCK.lock().unwrap();
+        std::env::set_var(GARAGETYTUS_HOME_ENV, "/tmp/garagetytus-grants-test");
+        let p = grants_path();
+        assert_eq!(
+            p,
+            PathBuf::from("/tmp/garagetytus-grants-test/config/grants.json")
+        );
+        std::env::remove_var(GARAGETYTUS_HOME_ENV);
+        let p_default = grants_path();
+        assert!(p_default.ends_with("garagetytus/grants.json"));
     }
 }

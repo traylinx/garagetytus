@@ -327,24 +327,48 @@ pub fn parse_perms(raw: &str) -> Result<&'static str> {
 //  Garage backend ops
 // ═══════════════════════════════════════════════════════════════
 
-fn config_path(ctx: &CliContext) -> PathBuf {
-    ctx.home().join("config/garage.toml")
+/// Resolve the seeded garagetytus.toml that `garagetytus install`
+/// wrote. Lives at `<config-dir>/garagetytus.toml` per LD#9 (config
+/// dir is OS-appropriate via dirs::config_dir, overridable via
+/// GARAGETYTUS_HOME).
+fn config_path(_ctx: &CliContext) -> PathBuf {
+    garagetytus_core::paths::config_dir().join("garagetytus.toml")
+}
+
+/// Probe known locations for the `garage` binary. Mirrors the
+/// helper in commands::start so bucket subcommands work the same
+/// whether invoked manually or via the daemon-supervised path.
+fn locate_garage() -> PathBuf {
+    let candidates: [PathBuf; 3] = [
+        dirs::home_dir().unwrap_or_default().join(".local/bin/garage"),
+        PathBuf::from("/opt/homebrew/bin/garage"),
+        PathBuf::from("/usr/local/bin/garage"),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return c.clone();
+        }
+    }
+    PathBuf::from("garage")
 }
 
 fn run_garage_cli(ctx: &CliContext, args: &[&str]) -> Result<String> {
     let cfg = config_path(ctx);
     if !cfg.exists() {
         bail!(
-            "garage config missing at {} — run `makakoo plugin install --core garage-store` first",
+            "garagetytus config missing at {} — run `garagetytus install` first",
             cfg.display()
         );
     }
-    let out = Command::new("garage")
+    let garage_bin = locate_garage();
+    let out = Command::new(&garage_bin)
         .arg("-c")
         .arg(&cfg)
         .args(args)
         .output()
-        .with_context(|| format!("invoking `garage {}`", args.join(" ")))?;
+        .with_context(|| {
+            format!("invoking `{} {}`", garage_bin.display(), args.join(" "))
+        })?;
     if !out.status.success() {
         bail!(
             "garage {} failed (exit {}): {}",
@@ -673,7 +697,7 @@ fn info(ctx: &CliContext, name: &str, json: bool) -> Result<i32> {
     let backend = backend_for(Some(bucket.endpoint.as_str()))?;
     let size = backend.bucket_size(ctx, name).unwrap_or(0);
 
-    let user_grants = UserGrants::load(ctx.home());
+    let user_grants = UserGrants::load_at(&garagetytus_core::paths::grants_path());
     let grants: Vec<&UserGrant> = user_grants
         .grants
         .iter()
@@ -781,7 +805,7 @@ fn grant(
     let expires_at = dur.map(|d| now + d);
 
     // Rate-limit shared with fs/write grants — same Locked Decision.
-    let user_grants_existing = UserGrants::load(ctx.home());
+    let user_grants_existing = UserGrants::load_at(&garagetytus_core::paths::grants_path());
     let active_count = user_grants_existing.active_grants(now).len();
     rate_limit::check_and_increment(active_count, ctx.home(), now)?;
 
@@ -867,7 +891,7 @@ fn grant(
 // ─── revoke ──────────────────────────────────────────────────
 
 fn revoke(ctx: &CliContext, grant_id: &str) -> Result<i32> {
-    let mut user_grants = UserGrants::load(ctx.home());
+    let mut user_grants = UserGrants::load_at(&garagetytus_core::paths::grants_path());
     let grant = match user_grants.get(grant_id) {
         Some(g) => g.clone(),
         None => bail!("no grant with id {grant_id:?}"),
@@ -948,7 +972,7 @@ fn expire(ctx: &CliContext, dry_run: bool) -> Result<i32> {
         eprintln!("No buckets past TTL. Nothing to expire.");
         return Ok(0);
     }
-    let user_grants = UserGrants::load(ctx.home());
+    let user_grants = UserGrants::load_at(&garagetytus_core::paths::grants_path());
     let mut report: Vec<HashMap<String, serde_json::Value>> = Vec::new();
 
     for bucket in &expired {

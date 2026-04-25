@@ -524,7 +524,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-#[cfg(target_os = "linux")]
+/// AC7 verifier — re-reads `path` from disk and compares its
+/// SHA-256 against the pinned `expected_sha`. Surfaces the
+/// concrete (expected, actual) hex pair on mismatch so tampering
+/// is auditable. Cross-platform — used on Linux for boot-time
+/// pin enforcement, available on every target for test harnesses.
 fn verify_sha(path: &Path, expected_sha: &str) -> Result<()> {
     let bytes =
         fs::read(path).with_context(|| format!("read {}", path.display()))?;
@@ -661,5 +665,52 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// AC7 — tampered binary fails SHA verify with a clear
+    /// (expected, actual) message. Writes "abc" to a temp file
+    /// (known SHA) then asserts the wrong-SHA path errors.
+    #[test]
+    fn verify_sha_rejects_tampered_binary() {
+        let tmp = tempdir().unwrap();
+        let bin = tmp.path().join("garage");
+        std::fs::write(&bin, b"abc").unwrap();
+
+        // Right SHA: Ok.
+        let right_sha =
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        verify_sha(&bin, right_sha).expect("matching SHA should pass");
+
+        // Wrong SHA: Err with the diff surfaced.
+        let wrong_sha =
+            "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_sha(&bin, wrong_sha).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SHA mismatch"),
+            "expected SHA mismatch, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(right_sha),
+            "expected message to surface actual SHA: {}",
+            msg
+        );
+        assert!(
+            msg.contains(wrong_sha),
+            "expected message to surface expected SHA: {}",
+            msg
+        );
+    }
+
+    /// AC7 — verify_sha errors cleanly when the file doesn't
+    /// exist (rather than silently passing).
+    #[test]
+    fn verify_sha_errors_on_missing_file() {
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        let err = verify_sha(&missing, "abc").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("read"), "unexpected error: {}", msg);
     }
 }
