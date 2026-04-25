@@ -53,6 +53,91 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: BucketCmd,
     },
+    /// v0.5 multinode cluster lifecycle (Mac + Tytus droplet).
+    /// Per-subcommand details surface in the canonical sprint at
+    /// `MAKAKOO/development/sprints/queued/MAKAKOO-OS-V0.8-S3-CLUSTER/`
+    /// + the garagetytus-side wrapper at
+    /// `GARAGETYTUS-V0.5-MULTINODE/`. Phase 0 probes gate Phase A;
+    /// scaffolding lands ahead so Phase A integrates cleanly.
+    Cluster {
+        #[command(subcommand)]
+        cmd: ClusterCmd,
+    },
+    /// Local-node Garage repair (`garage repair tables --yes`).
+    /// In single-node mode this is invoked automatically by the
+    /// AC8 unclean-shutdown flow (Q3 verdict, v0.1). In cluster
+    /// mode, see `garagetytus cluster repair` for orchestrated
+    /// per-node repair across the cluster.
+    Repair,
+}
+
+/// `garagetytus cluster *` — Q4 verdict locked invocation
+/// surface. Phase A.1 wires the SSH-driven `init` orchestration
+/// once Phase 0 probes record their outcomes; the CLI shape
+/// itself is final per the Q4-Q5-Q6 lope round 2026-04-25.
+#[derive(Subcommand, Debug)]
+pub enum ClusterCmd {
+    /// Bootstrap a 2-node Garage cluster (Mac + droplet).
+    /// Generates an `rpc_secret` if `--rpc-secret` is absent,
+    /// writes `<config_dir>/cluster.toml`, and (in Phase A.1)
+    /// SSHes into the droplet to push the binary + secret +
+    /// systemd unit. The Q4 invocation host is garagetytus
+    /// itself — tytus stays the env-var sidecar + WG tunnel
+    /// owner, but does not own cluster orchestration.
+    Init {
+        /// Droplet SSH host (`user@host`). Required.
+        #[arg(long)]
+        droplet_host: String,
+
+        /// 32-byte hex (64 chars). Generated if absent.
+        #[arg(long)]
+        rpc_secret: Option<String>,
+
+        /// Mac zone name. Default `"mac"`. Immutable once set.
+        #[arg(long)]
+        mac_zone: Option<String>,
+
+        /// Droplet zone name. Default `"droplet"`. Immutable.
+        #[arg(long)]
+        droplet_zone: Option<String>,
+
+        /// Pod-facing endpoint over WG. Default
+        /// `http://10.42.42.1:3900/`.
+        #[arg(long)]
+        pod_endpoint: Option<String>,
+
+        /// Print the plan but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Re-run even if `cluster.toml` already exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print cluster status (per-zone mode + reachability +
+    /// layout version + strict cluster_mode rollup). Reads
+    /// `<config_dir>/cluster.toml` + `<data_dir>/cluster_state.json`.
+    Status {
+        /// Emit JSON envelope instead of human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Orchestrate `garage repair tables --yes` across cluster
+    /// nodes. Per Q5 verdict — local repair on each node,
+    /// cluster anti-entropy reconciles cross-node drift.
+    Repair {
+        /// Comma-separated node list. Default: all (`mac,droplet`).
+        #[arg(long, value_delimiter = ',')]
+        nodes: Option<Vec<String>>,
+
+        /// Skip the orphan-PID sentinel check; force repair.
+        #[arg(long)]
+        force: bool,
+
+        /// Print the plan but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Bucket subcommand surface, carved verbatim from

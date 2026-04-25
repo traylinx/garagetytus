@@ -1,6 +1,7 @@
 pub mod about;
 pub mod bootstrap;
 pub mod bucket;
+pub mod cluster;
 pub mod install;
 pub mod metrics;
 pub mod start;

@@ -10,7 +10,7 @@ mod context;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Cmd};
+use cli::{Cli, ClusterCmd, Cmd};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
@@ -38,6 +38,31 @@ async fn main() -> Result<()> {
         Cmd::Bootstrap => commands::bootstrap::run(&ctx).await,
         Cmd::About => commands::about::run(),
         Cmd::Bucket { cmd } => commands::bucket::run(&ctx, cmd).await,
+        Cmd::Cluster { cmd } => match cmd {
+            ClusterCmd::Init {
+                droplet_host,
+                rpc_secret,
+                mac_zone,
+                droplet_zone,
+                pod_endpoint,
+                dry_run,
+                force,
+            } => commands::cluster::init(
+                &ctx,
+                droplet_host,
+                rpc_secret,
+                mac_zone,
+                droplet_zone,
+                pod_endpoint,
+                dry_run,
+                force,
+            ),
+            ClusterCmd::Status { json } => commands::cluster::status(&ctx, json),
+            ClusterCmd::Repair { nodes, force, dry_run } => {
+                commands::cluster::repair(&ctx, nodes, force, dry_run)
+            }
+        },
+        Cmd::Repair => commands::cluster::local_repair(&ctx),
     }?;
 
     std::process::exit(exit_code);

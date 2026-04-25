@@ -135,6 +135,28 @@ pub fn next_mode(prev: Mode, free_pct: f64) -> Mode {
     }
 }
 
+/// Q6 hybrid verdict — derive a strict cluster-wide mode from a
+/// set of per-zone modes. Cluster is `rw` iff EVERY zone is `rw`;
+/// any zone in `ro` flips the cluster rollup to `ro`. Empty input
+/// (no zones reporting) defaults to `ro` — the conservative
+/// "we don't know, so don't write" posture.
+///
+/// Used by `commands::metrics` to render the
+/// `garagetytus_cluster_mode{...}` rollup gauge alongside the
+/// per-zone primary signal. Pure function — no I/O — to keep the
+/// derivation deterministic and unit-testable across all
+/// {rw, ro}^N input combinations.
+pub fn derive_cluster_mode(zone_modes: &[(String, Mode)]) -> Mode {
+    if zone_modes.is_empty() {
+        return Mode::Ro;
+    }
+    if zone_modes.iter().all(|(_, m)| *m == Mode::Rw) {
+        Mode::Rw
+    } else {
+        Mode::Ro
+    }
+}
+
 /// Read the disk-free percentage on the partition that holds
 /// `data_dir`. Cross-platform via the `sysinfo` crate (LD#10 —
 /// no `df` shellout).
@@ -314,6 +336,67 @@ mod tests {
         // Threshold edges.
         assert_eq!(next_mode(Mode::Rw, 10.0), Mode::Rw);
         assert_eq!(next_mode(Mode::Rw, 9.99), Mode::Ro);
+    }
+
+    // ─── Q6 hybrid verdict — derive_cluster_mode ────────────
+
+    fn zones(spec: &[(&str, Mode)]) -> Vec<(String, Mode)> {
+        spec.iter().map(|(z, m)| (z.to_string(), *m)).collect()
+    }
+
+    #[test]
+    fn derive_cluster_mode_empty_input_is_ro() {
+        // No zones reporting → conservative "we don't know" posture.
+        assert_eq!(derive_cluster_mode(&[]), Mode::Ro);
+    }
+
+    #[test]
+    fn derive_cluster_mode_all_rw_is_rw() {
+        let z = zones(&[("mac", Mode::Rw), ("droplet", Mode::Rw)]);
+        assert_eq!(derive_cluster_mode(&z), Mode::Rw);
+    }
+
+    #[test]
+    fn derive_cluster_mode_any_ro_flips_cluster_to_ro() {
+        // Mac rw, droplet ro → cluster ro (strict aggregation).
+        let z = zones(&[("mac", Mode::Rw), ("droplet", Mode::Ro)]);
+        assert_eq!(derive_cluster_mode(&z), Mode::Ro);
+        // Reverse — same outcome.
+        let z = zones(&[("mac", Mode::Ro), ("droplet", Mode::Rw)]);
+        assert_eq!(derive_cluster_mode(&z), Mode::Ro);
+    }
+
+    #[test]
+    fn derive_cluster_mode_all_ro_is_ro() {
+        let z = zones(&[("mac", Mode::Ro), ("droplet", Mode::Ro)]);
+        assert_eq!(derive_cluster_mode(&z), Mode::Ro);
+    }
+
+    #[test]
+    fn derive_cluster_mode_single_zone_passes_through() {
+        // v0.1 single-node degenerate case: one zone reporting.
+        // Strict aggregation = identity for n=1.
+        let z = zones(&[("mac", Mode::Rw)]);
+        assert_eq!(derive_cluster_mode(&z), Mode::Rw);
+        let z = zones(&[("mac", Mode::Ro)]);
+        assert_eq!(derive_cluster_mode(&z), Mode::Ro);
+    }
+
+    #[test]
+    fn derive_cluster_mode_three_node_future_proofing() {
+        // v0.9+ N>2 case: still strict — all rw → rw, any ro → ro.
+        let z = zones(&[
+            ("mac", Mode::Rw),
+            ("droplet-a", Mode::Rw),
+            ("droplet-b", Mode::Rw),
+        ]);
+        assert_eq!(derive_cluster_mode(&z), Mode::Rw);
+        let z = zones(&[
+            ("mac", Mode::Rw),
+            ("droplet-a", Mode::Rw),
+            ("droplet-b", Mode::Ro),
+        ]);
+        assert_eq!(derive_cluster_mode(&z), Mode::Ro);
     }
 
     #[test]

@@ -5,6 +5,76 @@ All notable changes to garagetytus.
 The format is based on [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/).
 
+## [Unreleased — v0.5 multinode scaffolding] — 2026-04-25
+
+> Scaffolding for the v0.5 multinode sprint
+> (`MAKAKOO/development/sprints/queued/GARAGETYTUS-V0.5-MULTINODE/`).
+> Phase 0 droplet probes still gate Phase A execution; this
+> commit lands the Phase-0-independent type system + CLI shape +
+> metrics extension + tests so Phase A integrates cleanly the
+> moment Phase 0 results record.
+
+### v0.5 type system + CLI shape (Q4-Q5-Q6 lope-locked)
+
+- **`garagetytus-core::cluster`** — `ClusterConfig` (rpc_secret +
+  zones + droplet_host + pod_endpoint + replication_factor) +
+  `ClusterState` (per-node liveness + layout version) +
+  validation + serde + path resolution. Pure types; no network,
+  no SSH, no subprocess. **11 unit tests.**
+- **`garagetytus-watchdogs::derive_cluster_mode`** — Q6 hybrid
+  verdict implementation. Strict aggregation: cluster `rw` iff
+  every zone `rw`. Empty input → conservative `ro` ("we don't
+  know, don't write"). Pure function; **6 unit tests** covering
+  empty / all-rw / any-ro / all-ro / single-zone /
+  three-node-future-proofing cases.
+- **`garagetytus cluster {init,status,repair}`** — Q4-locked CLI
+  surface. `init` writes `<config_dir>/cluster.toml` atomically
+  (preflight only — Phase A.1 SSH orchestration lands once
+  Phase 0 outcomes record). `status` reads cluster.toml +
+  optional `cluster_state.json`. `repair` orchestration scaffold
+  prints the per-node plan; full SSH execution gated on Phase
+  A.1. `garagetytus repair` (single-node) shells
+  `garage repair tables --yes` directly. **4 unit tests.**
+- **`commands/metrics.rs` extension** — Q6 hybrid metric shape.
+  Reads optional `cluster_state.json` and renders per-zone +
+  per-node + cluster_mode rollup gauges when present; falls
+  through to v0.1 single-node format when absent. v0.1
+  `garagetytus_mode{...}` alias preserved verbatim. **4 new
+  tests** including a real-wire round-trip that binds an
+  ephemeral axum server, drops cluster_state.json, hits
+  `/metrics` over actual HTTP, and asserts the new gauges land
+  on the wire.
+- **Phase 0 probe scripts** at `sprint-v0.5/phase0/`. 8 bash
+  scripts (one per canonical-sprint probe) + driver
+  `probe.sh user@host` + README. Captures outputs to
+  `sprint-v0.5/phase0/results/PHASE-0-RESULTS-<date>.md` for
+  the operator to copy into the MAKAKOO sprint dir.
+
+### Test totals
+
+- garagetytus workspace: **130 pass, 0 fail, 0 warnings**
+  (60 lib + 1 contract + 17 core + 35 grants + 17 watchdogs;
+  +25 vs rc2 from v0.5 scaffolding). One pre-existing
+  parallel-runner flake on
+  `garagetytus_grants::audit::tests::query_spans_rotated_archives`
+  passes in isolation; identical pattern to the documented
+  v0.1-era flake.
+- garagetytus-sdk: 15 pass, 0 fail (unchanged).
+- makakoo-os workspace: unchanged (v0.5 changes are all
+  garagetytus-side; Makakoo wrapper still execs `garagetytus
+  bucket *` per Q2 verdict).
+
+### Sprint state
+
+- Drafted: `MAKAKOO/development/sprints/queued/GARAGETYTUS-V0.5-MULTINODE/SPRINT.md`
+  (carve-out wrapper around the canonical 802-LOC v0.8 sprint
+  pi+qwen round-1 hardened).
+- Locked: `verdicts/Q4-Q5-Q6-LOCKED.md` (lope round 2026-04-25,
+  pi + codex parallel; Q4 + Q5 unanimous A; Q6 hybrid).
+- Pending Phase 0: 8 probe scripts ready to run against a real
+  droplet. Operator action.
+- Phase A blocked on Phase 0 results recording.
+
 ## [v0.1.0-rc2 — AC8 auto-repair landed] — 2026-04-25
 
 > Status: workspace + bucket + grants + audit + rate-limit + AGPL

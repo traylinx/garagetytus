@@ -13,10 +13,15 @@
 //! the lifecycle commands).
 
 pub mod backend;
+pub mod cluster;
 pub mod paths;
 pub mod secrets;
 
 pub use backend::{Ctx, StorageBackend};
+pub use cluster::{
+    cluster_config_path, cluster_state_path, parse_config, serialize_config,
+    ClusterConfig, ClusterConfigError, ClusterState, NodeState,
+};
 pub use paths::{
     config_dir, data_dir, grants_path, home_dir, log_dir, GARAGETYTUS_HOME_ENV,
 };
