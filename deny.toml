@@ -1,0 +1,68 @@
+# cargo-deny config — runs in CI on every PR.
+#
+# Phase B.4 release-pipeline gate. Three checks:
+#   * `bans`      — LD#1 hard-fail on any garage-* crate dep at any
+#                   level. Belt-and-suspenders to the
+#                   `tests/contract_no_garage_crates.rs` Cargo.lock
+#                   grep + the AGPL-grep CI step.
+#   * `licenses`  — allowlist of permissive licenses; AGPL is denied
+#                   for the Rust dep tree (Garage stays a child
+#                   process; we never link it).
+#   * `advisories`— RustSec advisory database, fail on unmaintained
+#                   or known-vulnerable.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "0BSD",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+# AGPL is hard-denied for the Rust dep tree per LD#1. The bundled
+# Garage binary is AGPL but lives at OS-process boundary, not in
+# Cargo.toml.
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # LD#1 — explicit garage-* ban. The
+    # `tests/contract_no_garage_crates.rs` test does the same via
+    # Cargo.lock grep; this one runs at the dep-graph layer where
+    # cargo-deny resolves more thoroughly than a regex.
+    { name = "garage" },
+    { name = "garage_api" },
+    { name = "garage_block" },
+    { name = "garage_db" },
+    { name = "garage_model" },
+    { name = "garage_net" },
+    { name = "garage_rpc" },
+    { name = "garage_table" },
+    { name = "garage_util" },
+    { name = "garage_web" },
+]
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

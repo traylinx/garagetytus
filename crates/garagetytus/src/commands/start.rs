@@ -240,15 +240,50 @@ pub fn serve(_ctx: &CliContext) -> Result<i32> {
         cfg.display()
     );
 
-    // Spawn the watchdog tick loop alongside garage. Cooperatively
-    // shut down via the AtomicBool flag when garage exits.
+    // Spawn (1) the watchdog tick loop and (2) the LD#11 /metrics
+    // HTTP server alongside garage. Cooperatively shut down via the
+    // AtomicBool flag when garage exits.
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     let shutdown = Arc::new(AtomicBool::new(false));
-    let s_clone = shutdown.clone();
+    let watchdog_shutdown = shutdown.clone();
     let state_dir = garagetytus_core::paths::data_dir();
+    let watchdog_state_dir = state_dir.clone();
     let watchdog_handle = std::thread::spawn(move || {
-        spawn_watchdog_loop(state_dir, s_clone);
+        spawn_watchdog_loop(watchdog_state_dir, watchdog_shutdown);
+    });
+
+    // Metrics server on its own tokio runtime — independent thread
+    // so we don't have to assume `serve` already has a runtime in
+    // scope (foreground invocations from `serve` come from the
+    // `#[tokio::main]` runtime in main.rs anyway, but spawning on
+    // a fresh runtime keeps the lifecycle obvious).
+    let metrics_state_dir = state_dir.clone();
+    let metrics_shutdown = shutdown.clone();
+    let metrics_handle = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!("metrics server tokio runtime: {}", e);
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let server = super::metrics::serve_metrics(metrics_state_dir);
+            tokio::select! {
+                res = server => {
+                    if let Err(e) = res {
+                        tracing::warn!("metrics server stopped: {}", e);
+                    }
+                }
+                _ = poll_shutdown(metrics_shutdown) => {
+                    tracing::info!("metrics server: shutdown requested");
+                }
+            }
+        });
     });
 
     let status = Command::new(&garage)
@@ -257,8 +292,21 @@ pub fn serve(_ctx: &CliContext) -> Result<i32> {
 
     shutdown.store(true, Ordering::Relaxed);
     let _ = watchdog_handle.join();
+    let _ = metrics_handle.join();
 
     Ok(status.code().unwrap_or(1))
+}
+
+/// Poll the shutdown flag every second; resolve when it's set.
+/// Used to race against the metrics server in `tokio::select!`.
+async fn poll_shutdown(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 /// Watchdog tick loop — runs alongside `garagetytus serve`.

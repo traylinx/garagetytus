@@ -70,3 +70,18 @@ jobs:
             exit 1
           fi
           echo "AGPL grep clean."
+
+  cargo-deny:
+    name: cargo-deny (LD#1 + license + advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # `bans` enforces the explicit garage-* ban list at the
+          # resolver layer (LD#1 third gate alongside the
+          # contract test + AGPL grep).
+          # `licenses` enforces the permissive-only allowlist.
+          # `advisories` checks RustSec for known-vulnerable +
+          # yanked crates.
+          command: check bans licenses advisories

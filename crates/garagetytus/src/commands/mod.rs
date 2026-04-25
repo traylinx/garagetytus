@@ -2,6 +2,7 @@ pub mod about;
 pub mod bootstrap;
 pub mod bucket;
 pub mod install;
+pub mod metrics;
 pub mod start;
 
 /// Strict duration grammar: `30m | 1h | 24h | 7d | permanent`.

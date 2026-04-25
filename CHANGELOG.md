@@ -34,6 +34,15 @@ versions follow [SemVer](https://semver.org/).
   unclean-shutdown counter), keychain-migrate (legacy
   `makakoo-s3-service` → `s3-service`). LD#11 protocol writes
   `<state-dir>/watchdog.json` atomically. 8 unit tests.
+- **`commands/metrics.rs`** — LD#11 Prometheus `GET /metrics`
+  HTTP endpoint on `127.0.0.1:3904` (garagetytus's own admin
+  port; Garage owns 3903). Spawned alongside the watchdog
+  tick loop from `garagetytus serve` on its own tokio runtime.
+  Reads the latest `watchdog.json` per scrape; emits five
+  gauges/counters: `garagetytus_disk_free_pct`,
+  `garagetytus_mode{mode="rw|ro"}`, `garagetytus_uptime_seconds`,
+  `garagetytus_unclean_shutdown_total`,
+  `garagetytus_watchdog_last_tick_unix_seconds`. 5 unit tests.
 - **`garagetytus-sdk` (Python pip package)** — carved 376 LOC
   from `lib-harvey-core/src/core/s3/`. 15 tests.
   Cross-platform credential storage via `keyring` package
@@ -95,6 +104,10 @@ versions follow [SemVer](https://semver.org/).
 - Separate `pytest` job for `sdk/python/`.
 - LD#1 contract test runs separately on every PR.
 - AGPL-grep belt-and-suspenders job.
+- `cargo-deny check bans licenses advisories` — LD#1 third
+  gate (resolver-layer dep ban) + permissive-license allowlist
+  + RustSec advisory check. `deny.toml` at repo root pins the
+  config.
 
 ### Verdicts (lope, pi+codex)
 
@@ -113,7 +126,7 @@ versions follow [SemVer](https://semver.org/).
 
 ### Test totals
 
-- garagetytus workspace: **87 pass, 0 fail** (39 + 5 + 35 + 8).
+- garagetytus workspace: **92 pass, 0 fail** (44 + 5 + 35 + 8).
 - garagetytus-sdk: 15 pass, 0 fail.
 - makakoo-os workspace: 670 lib pass + 8 wrapper bin pass + 2
   pre-existing TOML failures (predate carve, reproduce on
@@ -126,14 +139,7 @@ versions follow [SemVer](https://semver.org/).
   serves again).
 - **AC2 / AC3 acceptance** — real install + uninstall +
   reboot-survival run on macOS + Linux.
-- **`/metrics` Prometheus HTTP endpoint** — deferred to v0.2
-  per LD#11 ("No IPC socket in v0.1; external integrations
-  poll either surface" — the JSON surface ships, the HTTP
-  surface waits).
 - **Phase C.3 Makakoo Python re-export flip** — gated on
   PyPI publish (codex consumption-boundary contract).
 - **Phase E (tytus team)** — separate repo, contract is in
   `docs/integrate/tytus.md`.
-- **`cargo-deny` config** — current LD#1 contract test +
-  AGPL-grep cover the common case; cargo-deny adds license +
-  advisory checks beyond.
