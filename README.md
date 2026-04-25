@@ -9,11 +9,29 @@ install only — Homebrew tap and `garagetytus.dev/install` web
 bootstrap land at the v0.1.0 (non-rc) tag once cargo-dist
 artifacts ship.
 
-## Install (v0.1.0-rc2 — source build)
+## Install (v0.1.0-rc2 — one-liner)
 
-**Prereq.** Rust 1.75+ on Mac or Linux. Garage on PATH (Mac:
-`brew install garage`; Linux: the in-binary installer downloads
-the upstream musl build + SHA-verifies).
+**macOS / Linux:**
+
+```bash
+curl -fsSL --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/traylinx/garagetytus/main/install/install.sh | bash
+```
+
+The installer bootstraps a temp `gum` (charmbracelet TUI),
+detects OS/arch, walks a 3-phase install plan (env → Garage
+daemon → garagetytus binary), and offers an interactive
+first-run wizard at the end. ~3-5 min on first run; subsequent
+re-runs hit the cargo cache and finish in seconds.
+
+**Non-interactive (CI / agents):**
+
+```bash
+GARAGETYTUS_NO_PROMPT=1 GARAGETYTUS_NO_ONBOARD=1 \
+  bash <(curl -fsSL https://raw.githubusercontent.com/traylinx/garagetytus/main/install/install.sh)
+```
+
+**Manual / source build (if you want full control):**
 
 ```bash
 git clone https://github.com/traylinx/garagetytus
@@ -28,16 +46,31 @@ garagetytus bucket grant my-data --to "external-app" --perms read,write --ttl 1h
 Then any S3-compatible client points at `http://127.0.0.1:3900`:
 boto3, aws-cli, rclone, pandas, Logseq S3-sync, anything.
 
+### For agents (Claude / Gemini / Codex / pi / etc.)
+
+Tell the agent **"install garagetytus"** and point it at the
+agent skill:
+
+```
+https://raw.githubusercontent.com/traylinx/garagetytus/main/.agents/skills/garagetytus/SKILL.md
+```
+
+The agent reads the SKILL.md, runs the one-liner via its shell
+tool, and verifies the install ended green. Same convention as
+[`2md`](https://github.com/traylinx/2md/blob/main/.agents/skills/2md/SKILL.md).
+
 ### Future install paths (v0.1.0 final, post cargo-dist)
 
 ```bash
 brew install traylinx/tap/garagetytus           # macOS  — not yet wired
-curl -fsSL garagetytus.dev/install | sh         # Linux — not yet wired
+curl -fsSL https://garagetytus.dev/install.sh | bash    # Linux — not yet wired
 ```
 
 These ship at the v0.1.0 (non-rc) tag once the Homebrew tap and
 the `garagetytus.dev` install endpoint are published. Track in
-`CHANGELOG.md` under "Pending for v0.1.0 (non-rc) tag."
+`CHANGELOG.md` under "Pending for v0.1.0 (non-rc) tag." The
+`raw.githubusercontent.com` one-liner above stays canonical
+until then.
 
 **Windows targets v0.2** (lope verdict 2026-04-25 — Garage upstream
 ships no Windows binary; v0.1 budget can't carry a Windows build

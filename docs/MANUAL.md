@@ -108,26 +108,25 @@ export GARAGETYTUS_HOME=/tmp/gtx-test
 
 ## 3. Install — macOS
 
-> **v0.1.0-rc2 pre-release note.** The Homebrew tap and the
-> `garagetytus.dev/install` web bootstrap below land at the
-> v0.1.0 (non-rc) tag once cargo-dist artifacts ship. Until then,
-> use the source-build path:
->
-> ```bash
-> brew install garage     # AGPL upstream daemon
-> git clone https://github.com/traylinx/garagetytus
-> cd garagetytus && cargo install --path crates/garagetytus
-> ```
-
-**Prereq.** Homebrew on PATH. Garage upstream ships no Mac binary,
-so we compile from source via the `garage` formula (Q1 verdict
-2026-04-25). First install takes ~3–5 min for the rust compile;
-subsequent updates are cached.
+The v0.1.0-rc2 install path is the source-build one-liner:
 
 ```bash
-brew install traylinx/tap/garagetytus       # post-cargo-dist; not yet wired
-garagetytus install
+curl -fsSL --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/traylinx/garagetytus/main/install/install.sh | bash
 ```
+
+The installer bootstraps a temp `gum`, detects macOS + arch,
+walks a 3-phase plan, and offers a first-run wizard. **Prereq:**
+Homebrew on PATH (used to install the AGPL Garage daemon — Garage
+upstream ships no native Mac binary in v0.1; the formula compiles
+it from source, ~3-5 min first time).
+
+If `cargo` isn't on PATH, the installer prints the rustup
+one-liner to run yourself (rustup edits shell init files, so
+explicit consent is required).
+
+> **Future install paths** (post cargo-dist artifacts at v0.1.0
+> non-rc): `brew install traylinx/tap/garagetytus`. Not yet wired.
 
 What `garagetytus install` does on Mac:
 
@@ -157,19 +156,24 @@ Then bring the daemon up — see §6.
 
 ## 4. Install — Linux
 
-> **v0.1.0-rc2 pre-release note.** Same as Mac — the
-> `garagetytus.dev/install` web bootstrap lands at the v0.1.0
-> (non-rc) tag. For now, source-build:
->
-> ```bash
-> git clone https://github.com/traylinx/garagetytus
-> cd garagetytus && cargo install --path crates/garagetytus
-> ```
+Same one-liner as macOS:
 
 ```bash
-curl -fsSL https://garagetytus.dev/install | sh    # post-cargo-dist; not yet wired
-garagetytus install
+curl -fsSL --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/traylinx/garagetytus/main/install/install.sh | bash
 ```
+
+The Linux branch downloads the upstream Garage musl binary
+(`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`),
+SHA-256 verifies against the pinned hash in `versions.toml`, and
+drops it at `~/.local/bin/garage`. SHA mismatch is fatal — the
+installer refuses and points at the issue tracker. Then
+`cargo install --git ... --bin garagetytus` compiles + installs
+the binary to `~/.cargo/bin/garagetytus`.
+
+> **Future install paths** (post cargo-dist artifacts at v0.1.0
+> non-rc): `curl -fsSL https://garagetytus.dev/install.sh | bash`.
+> Not yet wired.
 
 What `garagetytus install` does on Linux:
 
