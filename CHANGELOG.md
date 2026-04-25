@@ -5,18 +5,19 @@ All notable changes to garagetytus.
 The format is based on [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/).
 
-## [Unreleased — Phase A–F carve-out, 2026-04-25]
+## [v0.1.0-rc1 — code-complete, awaiting AC2/AC3/AC8 E2E run] — 2026-04-25
 
 > Status: workspace + bucket + grants + audit + rate-limit + AGPL
-> surface + docs all landed. **Tag pending** until the install /
-> start / watchdog modules ship real (vs stub) implementations
-> + cross-platform CI matrix is wired in.
+> surface + install + start + bootstrap + watchdogs + CI matrix
+> all landed. **Tag v0.1.0 issued only after a clean-host
+> acceptance run** (AC2 idempotence on macOS + Linux, AC3 service
+> registration with reboot, AC8 unclean-shutdown recovery).
 
 ### Carved from Makakoo v0.7.1
 
 - **`garagetytus-grants` crate** — `user_grants`, `rate_limit`,
   `audit`, `audit_escape` (1734 LOC carved verbatim from
-  `makakoo-os/makakoo-core/src/capability/`). 35 unit tests pass.
+  `makakoo-os/makakoo-core/src/capability/`). 35 unit tests.
   Schema version 1 frozen across both repos; drift fixtures
   vendored at `tests/fixtures/`.
 - **`garagetytus-core` crate** — cross-platform path resolution
@@ -28,13 +29,35 @@ versions follow [SemVer](https://semver.org/).
   carved verbatim from `makakoo/src/commands/bucket.rs` (1300 LOC,
   20 lib tests + 3 parse_duration tests + 1 contract test). Only
   rename: `makakoo_core::capability::*` → `garagetytus_grants::*`.
-  Stub install/start/bootstrap commands; real implementations
-  arrive alongside the release pipeline.
+- **`garagetytus-watchdogs` crate** — disk-watch (10/15
+  hysteresis via `sysinfo`), integrity-check (sentinel.lock +
+  unclean-shutdown counter), keychain-migrate (legacy
+  `makakoo-s3-service` → `s3-service`). LD#11 protocol writes
+  `<state-dir>/watchdog.json` atomically. 8 unit tests.
 - **`garagetytus-sdk` (Python pip package)** — carved 376 LOC
-  from `lib-harvey-core/src/core/s3/`. 15 tests pass.
+  from `lib-harvey-core/src/core/s3/`. 15 tests.
   Cross-platform credential storage via `keyring` package
   (LD#5/6); brand renames (`makakoo` → `garagetytus`,
   `MAKAKOO_PEER_NAME` retained as legacy fallback).
+
+### Subcommands (real impls)
+
+- `garagetytus install` — Mac path detects brew + `garage` and
+  generates plist via hand-rolled template (LD#3 fallback);
+  Linux path downloads upstream musl binary, SHA-verifies,
+  generates systemd-user unit; Windows prints v0.2 deferral.
+  Idempotent (AC2).
+- `garagetytus start / stop / status / restart / serve` —
+  `launchctl bootstrap/bootout` (Mac) + `systemctl --user`
+  (Linux). `serve` runs garage in foreground + spawns the
+  watchdog tick loop in a background thread.
+- `garagetytus bootstrap` — calls Garage admin API (`/v1/health`,
+  `/v1/cluster/layout`, `/v1/cluster/layout/apply`) for
+  single-node layout; provisions `s3-service` keypair via
+  `garage key create`; writes creds to OS keychain.
+- `garagetytus about` — AGPL surface (Phase B.5).
+- `garagetytus bucket {create, list, info, grant, revoke,
+  expire, deny-all}` — verbatim carve from Makakoo bucket.rs.
 
 ### AGPL posture
 
@@ -44,59 +67,73 @@ versions follow [SemVer](https://semver.org/).
 - `garagetytus about` subcommand surfaces the same values.
 - `tests/contract_no_garage_crates.rs` — LD#1 hard-fail gate
   (zero `garage-*` crate dependency at any level).
+- `.github/workflows/ci.yml` AGPL-grep job — fails on any
+  `use garage_*` / `extern crate garage_*` in source.
 
 ### Cross-platform install
 
-- `install/install.sh` — Linux + macOS web bootstrap (downloads
-  garagetytus binary from GitHub releases + drops on PATH).
+- `install/install.sh` — Linux + macOS web bootstrap.
 - `install/install.ps1` — Windows v0.2 deferral notice
-  bootstrap.
-- `install/homebrew-tap.rb` — Homebrew formula source. Declares
-  `depends_on "garage"` so the upstream brew formula compiles
-  AGPL source on macOS (Mac path per LD#7 amended).
+  bootstrap (exits 0).
+- `install/homebrew-tap.rb` — Homebrew formula source
+  (`depends_on "garage"` so brew compiles AGPL source on Mac).
 
 ### Docs
 
 - `README.md` — install + usage primer.
 - `docs/install/{macos,linux,windows}.md` — per-OS setup.
 - `docs/usage/quickstart.md` + `docs/usage/grants.md`.
-- `docs/integrate/{makakoo,tytus,external-app}.md` — integration
-  contracts for downstream consumers.
+- `docs/integrate/{makakoo,tytus,external-app}.md` —
+  integration contracts.
 - `LICENSE` (MIT) + `THIRD_PARTY_NOTICES` (Garage AGPL).
+
+### Cross-platform CI matrix (Phase B.4)
+
+`.github/workflows/ci.yml`:
+- macos-latest + ubuntu-latest matrix runs `cargo build
+  --workspace --all-targets` + `cargo test --workspace`.
+- Separate `pytest` job for `sdk/python/`.
+- LD#1 contract test runs separately on every PR.
+- AGPL-grep belt-and-suspenders job.
 
 ### Verdicts (lope, pi+codex)
 
-- **Q1** (`MAKAKOO/development/sprints/queued/GARAGETYTUS-V0.1/
-  verdicts/Q1-VERDICT.md`) — both PASS Option A: Mac via
-  Homebrew, Linux via upstream binary, Windows v0.2.
-- **Q2** (`Q2-VERDICT.md`) — both PASS Option A: Makakoo
-  `bucket *` becomes a thin wrapper that shell-outs to
-  `garagetytus bucket *` with inherited stdio.
+- **Q1** — both PASS Option A (Mac via Homebrew, Linux via
+  upstream musl, Windows v0.2). See `MAKAKOO/development/sprints/
+  queued/GARAGETYTUS-V0.1/verdicts/Q1-VERDICT.md`.
+- **Q2** — both PASS Option A (Makakoo `bucket *` becomes a
+  thin wrapper that exec's `garagetytus bucket *` with inherited
+  stdio). See `Q2-VERDICT.md`.
 
 ### Companion commits on `github.com/makakoo/makakoo-os`
 
-- `b723ef0` — Phase A.5: re-export `user_grants` shim.
-- `9573007` — Phase A.1: re-export `rate_limit` + `audit` +
-  `audit_escape` shims.
-- `ae97464` — Phase D: Makakoo bucket wrapper (Option A).
+- `b723ef0` — Phase A.5 user_grants shim.
+- `9573007` — Phase A.1 rate_limit + audit + audit_escape shims.
+- `ae97464` — Phase D Makakoo bucket wrapper (Q2 Option A).
 
-### Pending for v0.1 tag
+### Test totals
 
-- **Phase B real implementations** — install.rs (Linux musl
-  download + SHA-verify + plist/systemd template generation),
-  start.rs (launchctl + systemctl orchestration), bootstrap.rs
-  (admin-API layout assignment).
-- **LD#11 watchdog protocol** — `/metrics` endpoint + atomic
-  `<state-dir>/watchdog.json` writer.
-- **Phase B.4 cross-platform CI matrix** — GH Actions macos +
-  ubuntu runners.
-- **Phase C.3 Makakoo Python re-export flip** — deferred to
-  post-PyPI publish per codex consumption-boundary contract.
-- **Phase E** — tytus-side `tytus bucket` subcommand +
-  tray-menu cell. Requires modifications to the separate
-  `github.com/traylinx/tytus` repo; spec is in
-  `docs/integrate/tytus.md`, contract is ready, tytus team
-  picks it up.
-- **Acceptance contract** AC2/AC3/AC4/AC5/AC6/AC7/AC8/AC9 all
-  require the real install/start/watchdog modules + a clean-host
-  E2E run before tag.
+- garagetytus workspace: **87 pass, 0 fail** (39 + 5 + 35 + 8).
+- garagetytus-sdk: 15 pass, 0 fail.
+- makakoo-os workspace: 670 lib pass + 8 wrapper bin pass + 2
+  pre-existing TOML failures (predate carve, reproduce on
+  pristine HEAD).
+
+### Pending for v0.1.0 (non-rc) tag
+
+- **AC8 E2E run** on a clean host (kill garage with SIGKILL,
+  restart, integrity probe writes incremented counter, daemon
+  serves again).
+- **AC2 / AC3 acceptance** — real install + uninstall +
+  reboot-survival run on macOS + Linux.
+- **`/metrics` Prometheus HTTP endpoint** — deferred to v0.2
+  per LD#11 ("No IPC socket in v0.1; external integrations
+  poll either surface" — the JSON surface ships, the HTTP
+  surface waits).
+- **Phase C.3 Makakoo Python re-export flip** — gated on
+  PyPI publish (codex consumption-boundary contract).
+- **Phase E (tytus team)** — separate repo, contract is in
+  `docs/integrate/tytus.md`.
+- **`cargo-deny` config** — current LD#1 contract test +
+  AGPL-grep cover the common case; cargo-deny adds license +
+  advisory checks beyond.
