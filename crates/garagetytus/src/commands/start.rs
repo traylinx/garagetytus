@@ -131,16 +131,23 @@ pub fn stop(_ctx: &CliContext) -> Result<i32> {
         let status = Command::new("launchctl")
             .args(["bootout", &target])
             .status()?;
-        if status.success() || status.code() == Some(36) {
-            // 36 = "Could not find specified service" — already stopped.
-            println!("garagetytus stop: stopped");
-            Ok(0)
-        } else {
-            eprintln!(
-                "garagetytus stop: launchctl bootout failed (exit {})",
-                status.code().unwrap_or(-1)
-            );
-            Ok(1)
+        match status.code() {
+            // 0  = success.
+            // 3  = "No such process" — service entry exists but is
+            //      not loaded (idempotent path during uninstall).
+            // 36 = "Could not find specified service" — already
+            //      booted out.
+            Some(0) | Some(3) | Some(36) => {
+                println!("garagetytus stop: stopped");
+                Ok(0)
+            }
+            other => {
+                eprintln!(
+                    "garagetytus stop: launchctl bootout failed (exit {})",
+                    other.unwrap_or(-1)
+                );
+                Ok(1)
+            }
         }
     }
 

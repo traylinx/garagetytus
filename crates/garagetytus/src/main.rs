@@ -27,6 +27,9 @@ async fn main() -> Result<()> {
 
     let exit_code = match args.cmd {
         Cmd::Install => commands::install::run(&ctx).await,
+        Cmd::Uninstall { keep_data } => {
+            commands::install::uninstall(&ctx, keep_data).await
+        }
         Cmd::Start => commands::start::run(&ctx, false),
         Cmd::Stop => commands::start::stop(&ctx),
         Cmd::Status => commands::start::status(&ctx),

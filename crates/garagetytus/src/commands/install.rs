@@ -213,6 +213,104 @@ async fn linux_install(ctx: &CliContext) -> Result<i32> {
     Ok(0)
 }
 
+// ─── uninstall ───────────────────────────────────────────────
+
+pub async fn uninstall(_ctx: &CliContext, keep_data: bool) -> Result<i32> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (_ctx, keep_data);
+        eprintln!("{}", WINDOWS_DEFERRAL);
+        return Ok(0);
+    }
+
+    println!(
+        "garagetytus uninstall: removing service + config{}",
+        if keep_data {
+            " (data preserved via --keep-data)"
+        } else {
+            " + data"
+        }
+    );
+
+    // 1. Best-effort stop. Failures are fine — we may already be
+    //    stopped, or the binary may have crashed.
+    let _ = crate::commands::start::stop(_ctx);
+
+    // 2. Remove service unit (per-OS).
+    #[cfg(target_os = "macos")]
+    {
+        let plist = dirs::home_dir()
+            .unwrap_or_default()
+            .join("Library/LaunchAgents")
+            .join("com.traylinx.garagetytus.plist");
+        remove_if_exists(&plist, "plist");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let unit = dirs::config_dir()
+            .unwrap_or_default()
+            .join("systemd/user/garagetytus.service");
+        remove_if_exists(&unit, "systemd unit");
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+    }
+
+    // 3. Remove the s3-service keychain entry. Idempotent —
+    //    SecretsStore::delete swallows NoEntry.
+    if let Err(e) = garagetytus_core::SecretsStore::delete("s3-service") {
+        eprintln!(
+            "  warning: could not remove s3-service keychain entry: {} (skipping)",
+            e
+        );
+    } else {
+        println!("  keychain: s3-service removed");
+    }
+
+    // 4. Remove config + (optionally) data. Honors GARAGETYTUS_HOME.
+    let config_dir = garagetytus_core::paths::config_dir();
+    let log_dir = garagetytus_core::paths::log_dir();
+    remove_dir_if_exists(&config_dir, "config");
+    remove_dir_if_exists(&log_dir, "logs");
+    if !keep_data {
+        let data_dir = garagetytus_core::paths::data_dir();
+        remove_dir_if_exists(&data_dir, "data");
+    }
+
+    println!("garagetytus uninstall: done");
+    Ok(0)
+}
+
+fn remove_if_exists(path: &Path, label: &str) {
+    if !path.exists() {
+        return;
+    }
+    match fs::remove_file(path) {
+        Ok(()) => println!("  {}: removed {}", label, path.display()),
+        Err(e) => eprintln!(
+            "  warning: could not remove {} {}: {} (skipping)",
+            label,
+            path.display(),
+            e
+        ),
+    }
+}
+
+fn remove_dir_if_exists(path: &Path, label: &str) {
+    if !path.exists() {
+        return;
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => println!("  {}: removed {}", label, path.display()),
+        Err(e) => eprintln!(
+            "  warning: could not remove {} {}: {} (skipping)",
+            label,
+            path.display(),
+            e
+        ),
+    }
+}
+
 // ─── shared helpers ──────────────────────────────────────────
 
 fn random_hex(bytes: usize) -> String {

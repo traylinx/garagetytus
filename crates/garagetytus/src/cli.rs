@@ -18,11 +18,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// One-time installer — downloads upstream Garage (Linux) or
+        /// One-time installer — downloads upstream Garage (Linux) or
     /// detects Homebrew-installed Garage (macOS), seeds config,
     /// registers the per-user service. On Windows, prints a
     /// v0.2-deferral notice and exits 0.
     Install,
+    /// Uninstall — stop daemon, remove service unit + creds.
+    /// Pass --keep-data to preserve bucket data on disk.
+    Uninstall {
+        /// Preserve bucket data on disk (config + creds + service
+        /// unit are still removed).
+        #[arg(long)]
+        keep_data: bool,
+    },
     /// Start the garagetytus service.
     Start,
     /// Stop the garagetytus service.
