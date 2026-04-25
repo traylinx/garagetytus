@@ -1,0 +1,46 @@
+# garagetytus — pinned upstream Garage acquisition table.
+#
+# Each pin records: version, target triple, acquisition URL,
+# SHA-256, source-availability URL, license. Used by:
+#   * `garagetytus install` (Linux branch — direct binary download
+#     + SHA verify, see install.rs).
+#   * `garagetytus about` (B.5 AGPL surface — prints the table).
+#   * The homebrew tap formula (Mac branch — formula declares
+#     `depends_on "garage"`, the upstream brew formula's own pin
+#     is the source of truth there).
+#
+# Adding a new pin requires a deliberate commit + version bump.
+
+schema_version = 1
+
+[[pin]]
+version = "2.3.0"
+target = "x86_64-unknown-linux-musl"
+url = "https://garagehq.deuxfleurs.fr/_releases/v2.3.0/x86_64-unknown-linux-musl/garage"
+sha256 = "f98d317942bb341151a2775162016bb50cf86b865d0108de03eb5db16e2120cd"
+size = 71281456
+source_url = "https://git.deuxfleurs.fr/Deuxfleurs/garage/src/tag/v2.3.0"
+license = "AGPL-3.0-or-later"
+
+[[pin]]
+version = "2.3.0"
+target = "aarch64-unknown-linux-musl"
+url = "https://garagehq.deuxfleurs.fr/_releases/v2.3.0/aarch64-unknown-linux-musl/garage"
+sha256 = "8ced2ad3040262571de08aa600959aa51f97576d55da7946fcde6f66140705e2"
+source_url = "https://git.deuxfleurs.fr/Deuxfleurs/garage/src/tag/v2.3.0"
+license = "AGPL-3.0-or-later"
+
+# macOS pin — informational only. Acquisition is via Homebrew
+# formula; the upstream `garage` formula already pins the AGPL
+# source tarball SHA at the formula's `sha256` declaration. v0.1
+# does not download a binary on Mac.
+[[pin]]
+version = "2.3.0"
+target = "macos-via-homebrew"
+url = "https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/g/garage.rb"
+source_tarball_sha256 = "b83a981677676b35400bbbaf20974c396f32da31c7c7630ce55fc3e62c0e2e01"
+source_url = "https://git.deuxfleurs.fr/Deuxfleurs/garage/src/tag/v2.3.0"
+license = "AGPL-3.0-or-later"
+note = "compile-from-source via brew; no binary pin"
+
+# Windows: deferred to v0.2 per Q1 verdict. No pin entry.

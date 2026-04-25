@@ -1,0 +1,48 @@
+garagetytus — Third-Party Notices
+==================================
+
+garagetytus is licensed under the MIT License (see LICENSE file in
+this repository, or workspace Cargo.toml).
+
+garagetytus orchestrates a child `garage` process; it does **not**
+link against Garage or any garage-* crate (LD#1). The Garage source
+is owned and maintained by the Deuxfleurs collective:
+
+  Project       : Garage
+  License       : AGPL-3.0-or-later
+  Source        : https://git.deuxfleurs.fr/Deuxfleurs/garage
+  Bundled tag   : v2.3.0
+  Tarball SHA   : b83a981677676b35400bbbaf20974c396f32da31c7c7630ce55fc3e62c0e2e01
+
+Acquisition path (LD#7 amended 2026-04-25 per Q1 verdict — Garage
+upstream ships no Mac/Windows binary):
+
+  * Linux (x86_64-musl, aarch64-musl):
+      https://garagehq.deuxfleurs.fr/_releases/v2.3.0/<target>/garage
+      Pinned SHA-256 per architecture (see versions.toml).
+
+  * macOS:
+      Homebrew formula `traylinx/tap/garagetytus` declares
+      `depends_on "garage"`. The upstream `garage` formula compiles
+      from the AGPL source tarball above (formula's own `sha256`
+      declaration is the pin).
+
+  * Windows:
+      v0.1 prints a v0.2-deferral notice and exits 0. Reopens at
+      v0.2 with explicit scope (build-our-own / WSL2 / drop).
+
+Compliance posture:
+
+  1. AGPL source-availability is satisfied at install time — the
+     `garagetytus install` flow surfaces the upstream source URL
+     before download.
+  2. `garagetytus about` prints these values verbatim plus a path
+     to this file.
+  3. No `garage-*` Rust crate is ever imported, linked, or pulled
+     in transitively. CI grep + cargo-deny enforce this on every PR
+     (Phase B.4).
+
+Other dependencies are direct Rust crates whose licenses are
+recorded in the Cargo.toml `license` fields and tracked by
+`cargo-deny`. None impose attribution requirements beyond what
+their respective README/LICENSE files state.
