@@ -610,6 +610,35 @@ v0.5.1 will replace the bash helper with a native
 `garagetytus folder prompt` subcommand that does the same
 thing without requiring the cloned repo on $PATH.
 
+### Verifying the agent absorbed the prompt
+
+After pasting the setup prompt, paste a probe to confirm the
+agent actually got it. The repo ships
+`bin/garagetytus-agent-probe`:
+
+```bash
+# Smoke test (default) — asks the agent to state its bucket /
+# identity and produce the exact PUT/LIST commands:
+./bin/garagetytus-agent-probe --copy
+
+# Scoped to a specific bucket:
+./bin/garagetytus-agent-probe --bucket work --copy
+
+# Live round-trip — asks the agent to actually PUT a probe
+# file and report the s3:// URL so you can verify from Mac:
+./bin/garagetytus-agent-probe --live --copy
+
+# Multi-bucket routing test (only useful with >1 bucket granted):
+./bin/garagetytus-agent-probe --multi --copy
+```
+
+Pass criteria, fail tells, and recovery steps are documented in
+`skills/garagetytus-shared-folder/PROBE-PROMPT.md`. Short
+version: the agent should produce the actual bucket name +
+endpoint + pod-id literally — not placeholders, not invented
+endpoints. If the response says "I don't have S3 access", the
+setup prompt didn't land or got dropped from the chat context.
+
 ### Pod-side discovery — `/etc/garagetytus.shared.json`
 
 For each pod, drop a JSON manifest at `/etc/garagetytus.shared.json`

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# garagetytus-agent-probe — emit a probe prompt that asks an
+# agent in a tytus pod to demonstrate it knows how to use the
+# shared file system. Paste into the chat window AFTER
+# `garagetytus-agent-prompt` has been pasted.
+#
+# Usage:
+#   garagetytus-agent-probe [--bucket NAME] [--multi] [--live] [--copy]
+#
+# Options:
+#   --bucket NAME   ask the probe scoped to this bucket name
+#                   (otherwise the probe asks the agent to
+#                   enumerate access)
+#   --multi         use the multi-bucket routing probe (only
+#                   useful if the pod has access to >1 bucket)
+#   --live          use the "actually do it" probe — instructs
+#                   the agent to PUT a probe file and report back
+#                   (Sebastian then verifies from Mac)
+#   --copy          also pipe to pbcopy / xclip / wl-copy
+#   -h, --help      this help
+#
+# Without flags, emits the smoke-test probe asking the agent to
+# state its bucket/identity and produce three exact CLI commands.
+
+set -euo pipefail
+
+BUCKET=""
+MODE="smoke"
+COPY=0
+
+err() { printf 'garagetytus-agent-probe: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '1,20p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bucket) BUCKET="$2"; shift 2;;
+        --multi)  MODE="multi";  shift;;
+        --live)   MODE="live";   shift;;
+        --copy)   COPY=1;        shift;;
+        -h|--help) usage; exit 0;;
+        *) err "unknown flag: $1 (try --help)";;
+    esac
+done
+
+case "$MODE" in
+    smoke)
+        if [[ -n "$BUCKET" ]]; then
+            scope="bucket $BUCKET"
+        else
+            scope="our shared file system"
+        fi
+        prompt="$(cat <<EOF
+Quick check on $scope:
+
+1. Which S3 bucket(s) do you have access to, and what's your
+   pod identity?
+2. Show me the exact \`aws s3 cp\` command you'd run to save a
+   file called "hello-sebastian.md" so I see it on my Mac.
+3. Show me the exact command you'd run to list files I've put
+   in from-mac/ for you.
+
+If shared-folder access isn't set up yet, say so plainly — do
+NOT guess endpoints or credentials.
+EOF
+        )"
+        ;;
+    live)
+        prompt="$(cat <<EOF
+Do this now and report back:
+
+1. Save a file called "probe-from-pod.md" with the content
+   "I'm alive at \$(date -u +%Y-%m-%dT%H:%M:%SZ) from
+   \$(hostname)" to the shared bucket.
+2. Run \`aws s3 ls\` to confirm it landed.
+3. Tell me the full s3:// URL you used so I can verify from
+   my Mac.
+EOF
+        )"
+        ;;
+    multi)
+        prompt="$(cat <<EOF
+You have access to multiple shared folders. Without running
+any commands, tell me:
+
+1. What buckets do you see in /etc/garagetytus.shared.json (or
+   via aws s3api list-buckets)?
+2. If I asked you to "save the meeting notes from today",
+   which bucket would you pick — and why?
+3. If I asked you to "send a file to all my pods", which
+   bucket?
+
+If you'd ask me before guessing, say that — that's the right
+answer when the routing isn't obvious from the task.
+EOF
+        )"
+        ;;
+esac
+
+if [[ "$COPY" -eq 1 ]]; then
+    if   command -v pbcopy  >/dev/null 2>&1; then printf '%s' "$prompt" | pbcopy
+    elif command -v xclip   >/dev/null 2>&1; then printf '%s' "$prompt" | xclip -selection clipboard
+    elif command -v wl-copy >/dev/null 2>&1; then printf '%s' "$prompt" | wl-copy
+    else printf 'garagetytus-agent-probe: no clipboard tool found; printing only\n\n' >&2
+    fi
+    [[ -t 2 ]] && printf 'garagetytus-agent-probe: copied to clipboard (also printed below)\n\n' >&2
+fi
+
+printf '%s\n' "$prompt"
