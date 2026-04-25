@@ -82,7 +82,11 @@ fn start(_ctx: &CliContext) -> Result<i32> {
 
     #[cfg(target_os = "linux")]
     {
-        let unit_path = systemd_unit_path();
+        // v0.5 Tier-1 fix #2 — pick the right systemctl scope
+        // based on which unit file actually exists. System-level
+        // (root install) → `systemctl`; user-level → `--user`.
+        let scope = systemctl_scope();
+        let unit_path = scope.unit_path();
         if !unit_path.exists() {
             eprintln!(
                 "garagetytus start: systemd unit missing at {} — run `garagetytus install` first.",
@@ -90,14 +94,16 @@ fn start(_ctx: &CliContext) -> Result<i32> {
             );
             return Ok(1);
         }
-        let _ = Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
+        let _ = scope
+            .systemctl_cmd()
+            .arg("daemon-reload")
             .status()?;
-        let status = Command::new("systemctl")
-            .args(["--user", "start", SERVICE_UNIT])
+        let status = scope
+            .systemctl_cmd()
+            .args(["start", SERVICE_UNIT])
             .status()?;
         if status.success() {
-            println!("garagetytus start: started {}", SERVICE_UNIT);
+            println!("garagetytus start: started {} ({})", SERVICE_UNIT, scope.label());
             Ok(0)
         } else {
             Ok(status.code().unwrap_or(1))
@@ -153,11 +159,13 @@ pub fn stop(_ctx: &CliContext) -> Result<i32> {
 
     #[cfg(target_os = "linux")]
     {
-        let status = Command::new("systemctl")
-            .args(["--user", "stop", SERVICE_UNIT])
+        let scope = systemctl_scope();
+        let status = scope
+            .systemctl_cmd()
+            .args(["stop", SERVICE_UNIT])
             .status()?;
         if status.success() {
-            println!("garagetytus stop: stopped {}", SERVICE_UNIT);
+            println!("garagetytus stop: stopped {} ({})", SERVICE_UNIT, scope.label());
             Ok(0)
         } else {
             Ok(status.code().unwrap_or(1))
@@ -211,11 +219,13 @@ pub fn status(_ctx: &CliContext) -> Result<i32> {
 
     #[cfg(target_os = "linux")]
     {
-        let out = Command::new("systemctl")
-            .args(["--user", "is-active", SERVICE_UNIT])
+        let scope = systemctl_scope();
+        let out = scope
+            .systemctl_cmd()
+            .args(["is-active", SERVICE_UNIT])
             .output()?;
         let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        println!("garagetytus status: {}", state);
+        println!("garagetytus status: {} ({})", state, scope.label());
         Ok(0)
     }
 
@@ -476,6 +486,58 @@ fn systemd_unit_path() -> std::path::PathBuf {
         .unwrap_or_default()
         .join("systemd/user")
         .join(SERVICE_UNIT)
+}
+
+/// v0.5 Tier-1 fix #2 — pick the systemd scope based on which
+/// unit file actually exists on disk. Prefers system-level
+/// (`/etc/systemd/system/`) when present, falls back to
+/// user-level (`~/.config/systemd/user/`). Lifecycle commands
+/// (`start`/`stop`/`status`) flip `systemctl` flags accordingly
+/// so a root install survives reboot via `multi-user.target`
+/// without needing `loginctl enable-linger`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemctlScope {
+    System,
+    User,
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_scope() -> SystemctlScope {
+    let system_path =
+        std::path::PathBuf::from("/etc/systemd/system").join(SERVICE_UNIT);
+    if system_path.exists() {
+        SystemctlScope::System
+    } else {
+        SystemctlScope::User
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SystemctlScope {
+    fn unit_path(self) -> std::path::PathBuf {
+        match self {
+            SystemctlScope::System => {
+                std::path::PathBuf::from("/etc/systemd/system").join(SERVICE_UNIT)
+            }
+            SystemctlScope::User => systemd_unit_path(),
+        }
+    }
+
+    fn systemctl_cmd(self) -> Command {
+        let mut cmd = Command::new("systemctl");
+        if self == SystemctlScope::User {
+            cmd.arg("--user");
+        }
+        cmd
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SystemctlScope::System => "system-level",
+            SystemctlScope::User => "user-level",
+        }
+    }
 }
 
 /// AC4 — TCP probe each garage port. Returns the list of ports
