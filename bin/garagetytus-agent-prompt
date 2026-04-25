@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# garagetytus-agent-prompt — emit a paste-ready agent chat prompt
+# for a granted bucket on a remote garagetytus daemon.
+#
+# Pastes into Claude Code / ChatGPT / OpenClaw / Hermes / etc.
+# running inside (or alongside) a tytus pod, so the agent knows
+# what bucket it has access to, what its identity is, what
+# endpoint to use, and how to PUT/GET/LIST without further setup.
+#
+# Usage:
+#   garagetytus-agent-prompt --bucket <name> --pod <pod-id> [options]
+#
+# Options:
+#   --bucket NAME        bucket name, e.g. "work" or "shared"             [required]
+#   --pod ID             pod identity, e.g. "wannolot-02"                 [required]
+#   --droplet HOST       SSH host for `garagetytus bucket grant` lookup
+#                        (default: env GARAGETYTUS_DROPLET, else fail)
+#   --endpoint URL       S3 endpoint exposed to the pod
+#                        (default: http://10.42.42.1:3900)
+#   --access-key K       skip SSH grant call, use these creds verbatim
+#   --secret-key S       skip SSH grant call, use these creds verbatim
+#   --ttl DURATION       passed to bucket grant (default: 30d)
+#   --copy               also pipe to pbcopy (macOS) or xclip (Linux)
+#   --no-grant           don't fetch new creds; require --access-key + --secret-key
+#   -h, --help           show this help and exit
+#
+# When --access-key + --secret-key are NOT given and --no-grant
+# is NOT set, the script SSHes to the droplet and runs:
+#
+#   garagetytus bucket grant <bucket> --to <pod> --perms read,write \
+#       --ttl <ttl> --json
+#
+# parsing the JSON for `access_key` and `secret_key`. This issues
+# a NEW grant — every invocation creates a new keypair. To reuse
+# an existing keypair, pass --access-key + --secret-key + --no-grant.
+
+set -euo pipefail
+
+BUCKET=""
+POD=""
+DROPLET="${GARAGETYTUS_DROPLET:-}"
+ENDPOINT="http://10.42.42.1:3900"
+ACCESS_KEY=""
+SECRET_KEY=""
+TTL="30d"
+COPY=0
+NO_GRANT=0
+
+err() { printf 'garagetytus-agent-prompt: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '1,40p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bucket)     BUCKET="$2";     shift 2;;
+        --pod)        POD="$2";        shift 2;;
+        --droplet)    DROPLET="$2";    shift 2;;
+        --endpoint)   ENDPOINT="$2";   shift 2;;
+        --access-key) ACCESS_KEY="$2"; shift 2;;
+        --secret-key) SECRET_KEY="$2"; shift 2;;
+        --ttl)        TTL="$2";        shift 2;;
+        --copy)       COPY=1;          shift;;
+        --no-grant)   NO_GRANT=1;      shift;;
+        -h|--help)    usage; exit 0;;
+        *)            err "unknown flag: $1 (try --help)";;
+    esac
+done
+
+[[ -z "$BUCKET" ]] && err "--bucket is required"
+[[ -z "$POD" ]]    && err "--pod is required"
+
+if [[ -z "$ACCESS_KEY" || -z "$SECRET_KEY" ]]; then
+    if [[ "$NO_GRANT" -eq 1 ]]; then
+        err "--no-grant given but --access-key and --secret-key not provided"
+    fi
+    [[ -z "$DROPLET" ]] && err "--droplet HOST or env GARAGETYTUS_DROPLET required when not passing --access-key/--secret-key"
+
+    command -v jq >/dev/null 2>&1 || err "jq is required to parse the grant JSON (brew install jq)"
+
+    json="$(ssh -o ConnectTimeout=5 "$DROPLET" \
+        "garagetytus bucket grant '$BUCKET' --to '$POD' --perms read,write --ttl '$TTL' --json" 2>/dev/null)" || \
+        err "remote 'garagetytus bucket grant' failed on $DROPLET (run with --no-grant + --access-key/--secret-key to skip)"
+
+    ACCESS_KEY="$(printf '%s' "$json" | jq -r '.access_key // empty')"
+    SECRET_KEY="$(printf '%s' "$json" | jq -r '.secret_key // empty')"
+    REMOTE_ENDPOINT="$(printf '%s' "$json" | jq -r '.endpoint_url // empty')"
+
+    [[ -z "$ACCESS_KEY" || -z "$SECRET_KEY" ]] && err "grant JSON did not contain access_key/secret_key — got: $json"
+
+    # Honor remote's endpoint_url only if user didn't pass --endpoint
+    if [[ "$ENDPOINT" == "http://10.42.42.1:3900" && -n "$REMOTE_ENDPOINT" ]]; then
+        :  # keep the WG-routable address; remote endpoint may be loopback
+    fi
+fi
+
+# Emit the paste-ready prompt.
+prompt="$(cat <<EOF
+You have access to a shared file system through a Garage S3
+bucket on Sebastian's droplet. Use this when you need to save a
+file Sebastian (or another pod) will see, or read a file
+they've added for you.
+
+ENDPOINT:    $ENDPOINT
+BUCKET:      $BUCKET
+YOUR ID:     $POD
+ACCESS KEY:  $ACCESS_KEY
+SECRET KEY:  $SECRET_KEY
+REGION:      garage
+
+# How to PUT a file (Sebastian or other pods will see it):
+aws s3 cp ./your-file.md s3://$BUCKET/from-$POD/your-file.md \\
+    --endpoint $ENDPOINT \\
+    --region garage \\
+    --profile garagetytus
+
+# How to LIST what's in the bucket:
+aws s3 ls s3://$BUCKET/ --recursive \\
+    --endpoint $ENDPOINT \\
+    --region garage --profile garagetytus
+
+# How to GET a file Sebastian sent you:
+aws s3 cp s3://$BUCKET/from-mac/instructions.md ./ \\
+    --endpoint $ENDPOINT \\
+    --region garage --profile garagetytus
+
+# First-time profile setup (run once per pod):
+aws configure set aws_access_key_id "$ACCESS_KEY" --profile garagetytus
+aws configure set aws_secret_access_key "$SECRET_KEY" --profile garagetytus
+aws configure set region garage --profile garagetytus
+
+NAMING CONVENTION inside this bucket:
+- Files YOU produce → prefix with from-$POD/
+  e.g. s3://$BUCKET/from-$POD/result.json
+- Files Sebastian sent you → look in from-mac/
+  e.g. s3://$BUCKET/from-mac/instructions.md
+- Files for ALL pods in this bucket → prefix with broadcast/
+  e.g. s3://$BUCKET/broadcast/2026-04-26-news.md
+
+WHAT NOT TO PUT IN THIS BUCKET:
+- Secrets / API keys / passwords (this bucket is shared)
+- Multi-GB blobs without explicit user approval (disk is finite)
+- Conversational memory or chat history (use Brain instead)
+
+WHEN UNSURE which bucket to use, or whether something belongs
+in S3 vs Brain, ASK SEBASTIAN. Don't guess — wrong bucket =
+wrong audience.
+
+If the endpoint refuses connections (\`dial tcp $ENDPOINT:
+connection refused\`), the WireGuard tunnel or the droplet
+forwarder is down. Tell Sebastian; don't loop on retries.
+EOF
+)"
+
+if [[ "$COPY" -eq 1 ]]; then
+    if command -v pbcopy >/dev/null 2>&1; then
+        printf '%s' "$prompt" | pbcopy
+        printf 'garagetytus-agent-prompt: copied to clipboard (also printed below)\n\n' >&2
+    elif command -v xclip >/dev/null 2>&1; then
+        printf '%s' "$prompt" | xclip -selection clipboard
+        printf 'garagetytus-agent-prompt: copied to clipboard via xclip (also printed below)\n\n' >&2
+    elif command -v wl-copy >/dev/null 2>&1; then
+        printf '%s' "$prompt" | wl-copy
+        printf 'garagetytus-agent-prompt: copied to clipboard via wl-copy (also printed below)\n\n' >&2
+    else
+        printf 'garagetytus-agent-prompt: no clipboard tool found (need pbcopy/xclip/wl-copy); printing only\n\n' >&2
+    fi
+fi
+
+printf '%s\n' "$prompt"

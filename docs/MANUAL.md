@@ -575,6 +575,41 @@ grant is the access boundary. Use this for "this folder is
 work-only", "this folder is shared with my coding agent only",
 etc.
 
+### Drop-in agent prompt (paste into the chat window)
+
+Stateless chat windows (Claude Code in a fresh tab, ChatGPT,
+OpenClaw, Hermes, …) don't know they're inside a tytus pod or
+which bucket they have access to. The repo ships a helper that
+emits a self-contained system prompt with all the credentials,
+endpoint, bucket name, and naming convention inline:
+
+```bash
+# Bash helper bundled in the repo (./bin/garagetytus-agent-prompt):
+GARAGETYTUS_DROPLET=root@<droplet> \
+  ./bin/garagetytus-agent-prompt \
+      --bucket work --pod wannolot-02 --copy
+
+# → prints the prompt + copies it to clipboard.
+# Default behaviour: SSHes to the droplet and issues a fresh
+# 30-day grant. Pass --no-grant + --access-key/--secret-key to
+# reuse an existing keypair instead.
+```
+
+Paste the output into the agent's chat as the first message
+(or the runtime's system prompt slot if it has one). The agent
+now has explicit endpoint, bucket, identity, credentials, the
+PUT/GET/LIST recipes, the `from-<pod>/`+ `from-mac/` +
+`broadcast/` naming convention, and what NOT to put in the
+bucket — no implied prior knowledge of garagetytus or tytus.
+
+The static template lives at
+`skills/garagetytus-shared-folder/AGENT-PROMPT.md` for users
+who'd rather copy-edit by hand.
+
+v0.5.1 will replace the bash helper with a native
+`garagetytus folder prompt` subcommand that does the same
+thing without requiring the cloned repo on $PATH.
+
 ### Pod-side discovery — `/etc/garagetytus.shared.json`
 
 For each pod, drop a JSON manifest at `/etc/garagetytus.shared.json`
