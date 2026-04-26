@@ -491,7 +491,7 @@ garagetytus-pod-deprovision 04 --bucket testbucket   # one bucket
 garagetytus-pod-deprovision 04 --all-buckets         # all
 ```
 
-### Lifecycle commands (v0.5.2)
+### Lifecycle commands (v0.5.2 + v0.5.3)
 
 Inspect, change, or tear down a binding without writing rclone or
 launchctl by hand:
@@ -504,7 +504,12 @@ garagetytus folder list --json
 # Per-binding health probe (exit 0 OK / 1 degraded / 2 no bindings)
 garagetytus folder status                       # all
 garagetytus folder status ~/Documents/work      # one
-garagetytus folder status --check-pods --json   # incl. per-pod cred check
+garagetytus folder status --check-pods --json   # legacy fallback for binds without sidecar
+
+# Find unresolved bisync conflicts (rclone --conflict-resolve newer leaves a *.conflict1 loser on disk)
+garagetytus folder conflicts                    # scan every binding
+garagetytus folder conflicts ~/Documents/work   # one binding
+garagetytus folder conflicts --json             # machine-readable
 
 # Tear down. Default is conservative — local files + bucket survive
 # until you opt-in via flags. Idempotent re-run safe.
@@ -513,6 +518,8 @@ garagetytus folder unbind ~/Documents/work \
     --revoke-mac-bucket-allow                   # drop rclone key's bucket allow
 garagetytus folder unbind ~/Documents/work \
     --deprovision-pods 02,04                    # also deprovision named pods
+garagetytus folder unbind ~/Documents/work \
+    --deprovision-pods auto                     # read sidecar, deprovision exactly the pods that were bound
 garagetytus folder unbind ~/Documents/work \
     --drop-bucket --remove-local-files          # nuclear
 
@@ -529,6 +536,34 @@ The watchdog walks every running tytus-NN container, reads
 `_last-provision.json` for `next_refresh_due`, and rotates anything
 within the threshold. The pod's wrapper re-reads `credentials.json`
 on every call, so rotation needs no pod restart.
+
+#### Sidecar metadata (v0.5.3)
+
+Every `folder bind` writes a sidecar at
+`~/.cache/garagetytus/bisync/<safe-name>.bindings.json` describing
+which bucket, local path, pods, and interval the binding owns. Two
+behaviors depend on it:
+
+- **`folder status` flags missing pods** when the sidecar's
+  `pods_provisioned` list contains a pod whose container isn't
+  running OR whose `credentials.json` doesn't contain the bucket.
+  This converts the v0.5.2 "informational" pod check into a
+  hard failure that degrades the binding.
+- **`folder unbind --deprovision-pods auto`** reads the sidecar
+  to recover the exact pod list provisioned at bind time, so the
+  user doesn't have to type it back. Sidecar is read at the TOP
+  of unbind (before phase 1 wipes the workdir) and resolved into
+  the explicit pod list before phase 2 fires.
+
+#### Parallel pod provision (v0.5.3)
+
+`folder bind --to A --to B --to C` provisions the named pods in
+parallel; total wall time scales with the slowest single pod, not
+the sum. Per-pod tempfiles on the droplet (`/tmp/garagetytus-prov-<pod>-<ts>/`)
+prevent the cross-contamination race that the early v0.5.3 dogfood
+caught: previously, two concurrent provisions wrote to the same
+`/tmp/credentials.json` on the droplet and the second writer's
+credentials ended up in BOTH pods.
 
 ### Quick inspection (no helper required)
 
@@ -805,15 +840,19 @@ the four `ssh + rclone` commands above are the manual recipe.
   launchd polling auto-sync (Q14 Option 1), idempotent system-
   prompt fragment append (Q12), per-pod Garage key isolation
   (Q11), revoke-on-disconnect (Q13).
-- **v0.5.2 (this release)** — lifecycle commands shipped:
-  `garagetytus-folder-list`, `garagetytus-folder-status`
-  (`--check-pods` walks every tytus-NN container),
-  `garagetytus-folder-unbind` (idempotent, opt-in destruction
-  flags), `tytus-connect-with-bucket` Mac-side wrapper (delays
-  the tytus-cli Rust release until later), credential rotation
-  via `garagetytus-pod-refresh` + `garagetytus-refresh-watchdog`
-  (24h LaunchAgent walks pods, rotates any whose
-  `next_refresh_due` is within `--threshold-days`).
+- v0.5.2 — lifecycle commands shipped: `garagetytus-folder-list`,
+  `garagetytus-folder-status`, `garagetytus-folder-unbind`,
+  `tytus-connect-with-bucket` Mac-side wrapper, credential
+  rotation via `garagetytus-pod-refresh` + `garagetytus-refresh-watchdog`.
+- **v0.5.3 (this release)** — per-binding sidecar metadata at
+  `~/.cache/garagetytus/bisync/<safe-name>.bindings.json` powers:
+  (a) `folder status` flagging missing pods as DEGRADED instead
+  of just "informational", (b) `folder unbind --deprovision-pods auto`
+  reading the sidecar to skip typing the pod list back. New
+  `garagetytus folder conflicts` surfaces unresolved bisync
+  `*.conflict[0-9]*` losers. `folder bind --to A --to B`
+  provisions pods IN PARALLEL (per-pod droplet tempfiles fix the
+  race that early dogfood caught).
 - v0.6 — Rust daemon owning all bisync invocations (replaces N
   per-folder launchd plists with one supervisor); symmetric
   2-node replicated cluster (Garage netapp patch per Q10);

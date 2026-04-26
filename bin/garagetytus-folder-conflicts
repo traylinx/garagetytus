@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# garagetytus-folder-conflicts — surface unresolved bisync conflicts.
+#
+# rclone bisync with `--conflict-resolve newer` (which is what
+# `garagetytus folder bind --auto-sync` uses) resolves each
+# divergence by KEEPING the newer file under its original name and
+# RENAMING the loser to `<file>.conflict1` (or .conflict2 etc. on
+# repeat conflicts). The losers stay on disk silently — this command
+# scans for them so the user can review + delete + redo by hand.
+#
+# Usage:
+#   garagetytus folder conflicts [<local-path>] [--json]
+#
+# Without <local-path>: scan every binding registered in the v0.5.3
+# sidecars at ~/.cache/garagetytus/bisync/*.bindings.json.
+#
+# Exit code:
+#   0  — no conflicts anywhere
+#   1  — at least one conflict file found
+#   2  — no bindings to scan
+
+set -euo pipefail
+
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+WORKDIR_BASE="${HOME}/.cache/garagetytus/bisync"
+LOCAL_PATH=""
+JSON=0
+
+err() { printf 'folder-conflicts: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '1,21p' "$0" | sed 's|^# \{0,1\}||'; }
+
+if [[ "${1:-}" == "folder" && "${2:-}" == "conflicts" ]]; then shift 2; fi
+if [[ "${1:-}" == "conflicts" ]]; then shift; fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)    JSON=1; shift;;
+        -h|--help) usage; exit 0;;
+        --) shift; break;;
+        -*) err "unknown flag: $1 (try --help)";;
+        *)
+            if [[ -z "$LOCAL_PATH" ]]; then LOCAL_PATH="$1"
+            else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+if [[ -n "$LOCAL_PATH" ]]; then
+    case "$LOCAL_PATH" in
+        /*) ;;
+        ~*) LOCAL_PATH="${LOCAL_PATH/#\~/$HOME}";;
+        *)  LOCAL_PATH="$(pwd)/${LOCAL_PATH}";;
+    esac
+fi
+
+# Collect the local paths to scan
+declare -a paths_to_scan=()
+if [[ -n "$LOCAL_PATH" ]]; then
+    paths_to_scan+=("$LOCAL_PATH")
+else
+    shopt -s nullglob
+    sidecars=("${WORKDIR_BASE}"/*.bindings.json)
+    plists=("${PLIST_DIR}"/com.traylinx.garagetytus.bisync.*.plist)
+    shopt -u nullglob
+    for sc in "${sidecars[@]}"; do
+        p=$(jq -r '.local_path // ""' "$sc" 2>/dev/null)
+        [[ -n "$p" ]] && paths_to_scan+=("$p")
+    done
+    # Also pick up legacy bindings (no sidecar) by parsing plists
+    for plist in "${plists[@]}"; do
+        args=$(plutil -convert json -o - "$plist" 2>/dev/null \
+            | jq -r '.ProgramArguments[3] // ""')
+        [[ -z "$args" ]] && continue
+        plist_local=$(printf '%s' "$args" \
+            | sed -nE 's/.*bisync "([^"]+)" "[a-z0-9_-]+:[^"]+".*/\1/p')
+        # Avoid duplicates
+        if [[ -n "$plist_local" ]]; then
+            local_present=0
+            for existing in "${paths_to_scan[@]}"; do
+                [[ "$existing" == "$plist_local" ]] && { local_present=1; break; }
+            done
+            [[ "$local_present" -eq 0 ]] && paths_to_scan+=("$plist_local")
+        fi
+    done
+fi
+
+if [[ "${#paths_to_scan[@]}" -eq 0 ]]; then
+    if [[ "$JSON" -eq 1 ]]; then echo '[]'
+    else echo "(no folder bindings to scan)" >&2; fi
+    exit 2
+fi
+
+# Scan each path for *.conflict[0-9]* files and build report rows
+declare -a rows=()
+total_conflicts=0
+for p in "${paths_to_scan[@]}"; do
+    [[ -d "$p" ]] || continue
+    while IFS= read -r loser; do
+        # Derive winner path by stripping the .conflictN suffix
+        winner="${loser%.conflict*}"
+        loser_mtime=$(stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%SZ' "$loser" 2>/dev/null || echo "?")
+        loser_size=$(stat -f '%z' "$loser" 2>/dev/null || echo 0)
+        if [[ -f "$winner" ]]; then
+            winner_mtime=$(stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%SZ' "$winner" 2>/dev/null || echo "?")
+            winner_size=$(stat -f '%z' "$winner" 2>/dev/null || echo 0)
+            winner_present=true
+        else
+            winner_mtime="?"; winner_size=0; winner_present=false
+        fi
+        rows+=("$(jq -nc \
+            --arg local "$p" \
+            --arg loser "$loser" \
+            --arg winner "$winner" \
+            --arg loser_mt "$loser_mtime" \
+            --arg winner_mt "$winner_mtime" \
+            --argjson loser_sz "$loser_size" \
+            --argjson winner_sz "$winner_size" \
+            --argjson winner_present "$winner_present" \
+            '{local_path:$local, loser:$loser, winner:$winner,
+              loser_mtime:$loser_mt, loser_size:$loser_sz,
+              winner_mtime:$winner_mt, winner_size:$winner_sz,
+              winner_present:$winner_present}')")
+        total_conflicts=$(( total_conflicts + 1 ))
+    done < <(find "$p" -type f -name '*.conflict[0-9]*' 2>/dev/null)
+done
+
+if [[ "$JSON" -eq 1 ]]; then
+    printf '%s\n' "${rows[@]}" | jq -s '.'
+else
+    if [[ "$total_conflicts" -eq 0 ]]; then
+        echo "no unresolved conflicts across ${#paths_to_scan[@]} bound folder(s)"
+        exit 0
+    fi
+    printf '%d unresolved conflict(s) across %d folder(s):\n\n' \
+        "$total_conflicts" "${#paths_to_scan[@]}"
+    for row in "${rows[@]}"; do
+        loser=$(printf '%s' "$row" | jq -r '.loser')
+        winner=$(printf '%s' "$row" | jq -r '.winner')
+        loser_mt=$(printf '%s' "$row" | jq -r '.loser_mtime')
+        loser_sz=$(printf '%s' "$row" | jq -r '.loser_size')
+        winner_mt=$(printf '%s' "$row" | jq -r '.winner_mtime')
+        winner_sz=$(printf '%s' "$row" | jq -r '.winner_size')
+        winner_present=$(printf '%s' "$row" | jq -r '.winner_present')
+        printf '  ✗ %s\n' "$loser"
+        printf '    loser:   %d bytes  %s\n' "$loser_sz" "$loser_mt"
+        if [[ "$winner_present" == "true" ]]; then
+            printf '    winner:  %d bytes  %s  → %s\n' "$winner_sz" "$winner_mt" "$winner"
+            if [[ "$loser_sz" == "$winner_sz" ]]; then
+                printf '    suggest: same size — `diff` to confirm identical, then `rm %s`\n' "$loser"
+            else
+                printf '    suggest: review both, merge if needed, then `rm %s`\n' "$loser"
+            fi
+        else
+            printf '    winner:  MISSING — loser may be the only copy. rename it back: `mv %s %s`\n' "$loser" "$winner"
+        fi
+    done
+fi
+
+[[ "$total_conflicts" -gt 0 ]] && exit 1
+exit 0

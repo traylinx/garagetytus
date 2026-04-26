@@ -197,16 +197,22 @@ cp "$WRAPPER_LOCAL" "$TMP/garagetytus-shared"
 chmod 755 "$TMP/garagetytus-shared"
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
+    # Per-invocation unique tempdir on droplet — concurrent provisions
+    # of different pods MUST NOT race on shared /tmp paths. (Bug caught
+    # 2026-04-26 by parallel folder-bind: pod-02 ended up with pod-04's
+    # credentials.json because both wrote to /tmp/credentials.json.)
+    DROP_TMP="/tmp/garagetytus-prov-${POD_NUM}-$$-$(date +%s)"
+    run_droplet "mkdir -p ${DROP_TMP}"
     scp -q "$TMP/credentials.json" "$TMP/_last-provision.json" \
-        "$TMP/garagetytus-shared" "$DROPLET":/tmp/
+        "$TMP/garagetytus-shared" "$DROPLET":"${DROP_TMP}/"
     run_pod "mkdir -p /app/workspace/.garagetytus"
-    run_droplet "docker cp /tmp/garagetytus-shared ${CONTAINER}:/app/workspace/.garagetytus/garagetytus-shared && \
-                 docker cp /tmp/credentials.json ${CONTAINER}:/app/workspace/.garagetytus/credentials.json && \
-                 docker cp /tmp/_last-provision.json ${CONTAINER}:/app/workspace/.garagetytus/_last-provision.json"
+    run_droplet "docker cp ${DROP_TMP}/garagetytus-shared ${CONTAINER}:/app/workspace/.garagetytus/garagetytus-shared && \
+                 docker cp ${DROP_TMP}/credentials.json ${CONTAINER}:/app/workspace/.garagetytus/credentials.json && \
+                 docker cp ${DROP_TMP}/_last-provision.json ${CONTAINER}:/app/workspace/.garagetytus/_last-provision.json"
     run_pod "chmod 755 /app/workspace/.garagetytus/garagetytus-shared && \
              chmod 600 /app/workspace/.garagetytus/credentials.json && \
              chmod 644 /app/workspace/.garagetytus/_last-provision.json"
-    run_droplet "rm -f /tmp/credentials.json /tmp/_last-provision.json /tmp/garagetytus-shared"
+    run_droplet "rm -rf ${DROP_TMP}"
 fi
 
 # ── 4. build the systemPromptOverride append ──────────────────────
@@ -270,11 +276,13 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
             '.agents = (.agents // {}) | .agents.defaults = (.agents.defaults // {}) | .agents.defaults.systemPromptOverride = $sp')
 
     printf '%s' "$new_overlay" > "$TMP/config.user.json"
-    scp -q "$TMP/config.user.json" "$DROPLET":/tmp/config.user.json
+    # Per-invocation unique path on droplet to avoid concurrent races
+    DROP_OVERLAY="/tmp/garagetytus-overlay-${POD_NUM}-$$-$(date +%s).json"
+    scp -q "$TMP/config.user.json" "$DROPLET":"${DROP_OVERLAY}"
     # Backup pod's existing overlay before overwrite
     run_pod "cp /app/workspace/.openclaw/config.user.json /app/workspace/.openclaw/config.user.json.bak.\$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true"
-    run_droplet "docker cp /tmp/config.user.json ${CONTAINER}:/app/workspace/.openclaw/config.user.json && \
-                 rm -f /tmp/config.user.json"
+    run_droplet "docker cp ${DROP_OVERLAY} ${CONTAINER}:/app/workspace/.openclaw/config.user.json && \
+                 rm -f ${DROP_OVERLAY}"
 fi
 
 # ── 5. restart pod so the overlay merges into the live config ─────

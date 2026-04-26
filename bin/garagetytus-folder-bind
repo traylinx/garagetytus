@@ -261,22 +261,75 @@ else
     note "phase 5/6 — skipped (no --auto-sync; one-shot bisync only)"
 fi
 
-# ── 6. (optional) provision named pods ─────────────────────────────
+# ── 6. (optional) provision named pods, in parallel ───────────────
+declare -a provisioned_pods=()
 if [[ "${#PODS[@]}" -gt 0 ]]; then
-    note "phase 6/6 — provision pods: ${PODS[*]}"
+    note "phase 6/6 — provision pods (parallel): ${PODS[*]}"
     [[ -x "$PROVISION_SCRIPT" ]] || err "missing ${PROVISION_SCRIPT}"
-    for pod in "${PODS[@]}"; do
-        if [[ "$DRY_RUN" -eq 1 ]]; then
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        for pod in "${PODS[@]}"; do
             note "  DRY: would call ${PROVISION_SCRIPT} ${pod} --bucket ${BUCKET}"
-        else
-            extra=()
-            [[ "$NO_POD_RESTART" -eq 1 ]] && extra+=(--no-restart)
-            "$PROVISION_SCRIPT" "$pod" --bucket "$BUCKET" --droplet "$DROPLET" "${extra[@]}" \
-                || err "pod-provision failed for pod ${pod}"
-        fi
-    done
+        done
+        for pod in "${PODS[@]}"; do
+            case "$pod" in
+                wannolot-*|tytus-*) provisioned_pods+=("wannolot-${pod##*-}");;
+                *) provisioned_pods+=("wannolot-${pod}");;
+            esac
+        done
+    else
+        # Launch every pod-provision in background, capture log + pid.
+        declare -A pod_pids pod_logs
+        extra=()
+        [[ "$NO_POD_RESTART" -eq 1 ]] && extra+=(--no-restart)
+        for pod in "${PODS[@]}"; do
+            log=$(mktemp -t "garagetytus-prov-${pod}-XXXXXX")
+            pod_logs[$pod]="$log"
+            "$PROVISION_SCRIPT" "$pod" --bucket "$BUCKET" \
+                --droplet "$DROPLET" "${extra[@]}" >"$log" 2>&1 &
+            pod_pids[$pod]=$!
+            note "  launched provision for ${pod} (pid=${pod_pids[$pod]})"
+        done
+        # Wait + collect outcomes; print each pod's full log under a prefix
+        declare -a failed_pods=()
+        for pod in "${PODS[@]}"; do
+            if wait "${pod_pids[$pod]}"; then
+                case "$pod" in
+                    wannolot-*|tytus-*) provisioned_pods+=("wannolot-${pod##*-}");;
+                    *) provisioned_pods+=("wannolot-${pod}");;
+                esac
+            else
+                failed_pods+=("$pod")
+            fi
+            sed "s/^/    [pod-${pod}] /" "${pod_logs[$pod]}" >&2
+            rm -f "${pod_logs[$pod]}"
+        done
+        [[ "${#failed_pods[@]}" -gt 0 ]] && err "pod-provision failed for: ${failed_pods[*]}"
+    fi
 else
     note "phase 6/6 — skipped (no --to pods)"
+fi
+
+# ── 7. write sidecar binding metadata (always) ─────────────────────
+SIDECAR="${WORKDIR_BASE}/${SAFE_NAME}.bindings.json"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    bound_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    pods_json=$(printf '%s\n' "${provisioned_pods[@]}" | jq -R . | jq -s .)
+    [[ "${#provisioned_pods[@]}" -eq 0 ]] && pods_json='[]'
+    jq -n \
+        --arg bucket "$BUCKET" \
+        --arg local "$LOCAL_PATH" \
+        --arg ts "$bound_at" \
+        --argjson pods "$pods_json" \
+        --argjson interval "${INTERVAL}" \
+        --argjson auto "$AUTO_SYNC" \
+        --arg label "$PLIST_LABEL" \
+        --arg workdir "$WORKDIR" \
+        '{schema_version:1, bound_at:$ts, bucket:$bucket,
+          local_path:$local, pods_provisioned:$pods,
+          auto_sync:($auto==1), interval_sec:$interval,
+          plist_label:$label, workdir:$workdir}' \
+        > "$SIDECAR"
 fi
 
 note "✅ folder-bind complete: ${LOCAL_PATH} ↔ ${RCLONE_REMOTE}:${BUCKET}"

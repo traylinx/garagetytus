@@ -153,10 +153,13 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 printf '%s' "$new_creds" > "$TMP/credentials.json"
 printf '%s' "$new_audit" > "$TMP/_last-provision.json"
-scp -q "$TMP/credentials.json" "$TMP/_last-provision.json" "$DROPLET":/tmp/
-run_droplet "docker cp /tmp/credentials.json ${CONTAINER}:/app/workspace/.garagetytus/credentials.json && \
-             docker cp /tmp/_last-provision.json ${CONTAINER}:/app/workspace/.garagetytus/_last-provision.json"
+# Per-invocation unique tempdir to avoid races with concurrent refresh
+DROP_TMP="/tmp/garagetytus-refresh-${POD_NUM}-$$-$(date +%s)"
+run_droplet "mkdir -p ${DROP_TMP}"
+scp -q "$TMP/credentials.json" "$TMP/_last-provision.json" "$DROPLET":"${DROP_TMP}/"
+run_droplet "docker cp ${DROP_TMP}/credentials.json ${CONTAINER}:/app/workspace/.garagetytus/credentials.json && \
+             docker cp ${DROP_TMP}/_last-provision.json ${CONTAINER}:/app/workspace/.garagetytus/_last-provision.json"
 run_pod "chmod 600 /app/workspace/.garagetytus/credentials.json && chmod 644 /app/workspace/.garagetytus/_last-provision.json"
-run_droplet "rm -f /tmp/credentials.json /tmp/_last-provision.json"
+run_droplet "rm -rf ${DROP_TMP}"
 
 note "✅ refreshed ${POD_LABEL} — ${#buckets[@]} bucket(s) rotated, next refresh due ${next_refresh}"

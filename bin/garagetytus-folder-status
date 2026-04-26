@@ -179,21 +179,65 @@ probe_one() {
         checks+=("sync=recent|warn|no log file yet")
     fi
 
-    # Check 6 (optional): which pods have this bucket provisioned
-    local pods_provisioned=0
-    if [[ "$CHECK_PODS" -eq 1 ]]; then
+    # Check 6: pods. Two modes:
+    #   - sidecar present (v0.5.3+): verify each EXPECTED pod is still
+    #     running + credentials.json present + bucket in creds. Missing
+    #     = err = degrades the binding.
+    #   - sidecar absent (legacy): only when --check-pods is set, walk
+    #     every running tytus-NN container and report which have this
+    #     bucket. Informational only.
+    local sidecar="${WORKDIR_BASE}/${safe_name}.bindings.json"
+    if [[ -f "$sidecar" ]]; then
+        local expected_pods
+        mapfile -t expected_pods < <(jq -r '.pods_provisioned[]?' "$sidecar")
+        if [[ "${#expected_pods[@]}" -eq 0 ]]; then
+            checks+=("pods=expected|ok|none expected (bound without --to)")
+        else
+            local pod_label pod_container creds_check
+            for pod_label in "${expected_pods[@]}"; do
+                pod_container="tytus-${pod_label##*-}"
+                # is the container running?
+                if ! printf '%s\n' "${tytus_containers[@]}" \
+                        | grep -Fxq "$pod_container" 2>/dev/null; then
+                    # we may not have walked containers yet — refresh inline
+                    if [[ "${#tytus_containers[@]}" -eq 0 ]]; then
+                        while IFS= read -r c; do
+                            [[ -n "$c" ]] && tytus_containers+=("$c")
+                        done < <(ssh -o BatchMode=yes "$DROPLET" \
+                            'docker ps --filter name=tytus- --format "{{.Names}}"' 2>/dev/null)
+                    fi
+                fi
+                if ! printf '%s\n' "${tytus_containers[@]}" \
+                        | grep -Fxq "$pod_container" 2>/dev/null; then
+                    checks+=("pod=${pod_container}|err|container not running")
+                    degraded=1
+                    continue
+                fi
+                creds_check=$(ssh -o BatchMode=yes "$DROPLET" \
+                    "docker exec ${pod_container} sh -c 'jq -r \".buckets[].name\" /app/workspace/.garagetytus/credentials.json 2>/dev/null | grep -Fxq ${bucket} && echo PRESENT || echo ABSENT'" \
+                    2>/dev/null || echo "ABSENT")
+                if [[ "$creds_check" == *PRESENT* ]]; then
+                    checks+=("pod=${pod_container}|ok|bucket provisioned")
+                else
+                    checks+=("pod=${pod_container}|err|missing credentials.json or bucket entry")
+                    degraded=1
+                fi
+            done
+        fi
+    elif [[ "$CHECK_PODS" -eq 1 ]]; then
+        local pods_provisioned=0
         for c in "${tytus_containers[@]}"; do
-            local creds_check
-            creds_check=$(ssh -o BatchMode=yes "$DROPLET" \
+            local creds_check2
+            creds_check2=$(ssh -o BatchMode=yes "$DROPLET" \
                 "docker exec ${c} sh -c 'jq -r \".buckets[].name\" /app/workspace/.garagetytus/credentials.json 2>/dev/null | grep -Fxq ${bucket} && echo PRESENT || echo ABSENT'" \
                 2>/dev/null || echo "ABSENT")
-            if [[ "$creds_check" == *PRESENT* ]]; then
-                checks+=("pod=${c}|ok|bucket provisioned")
+            if [[ "$creds_check2" == *PRESENT* ]]; then
+                checks+=("pod=${c}|ok|bucket provisioned (no sidecar — legacy)")
                 pods_provisioned=$(( pods_provisioned + 1 ))
             fi
         done
         if [[ "$pods_provisioned" -eq 0 ]]; then
-            checks+=("pods_total=0|warn|no tytus pods have this bucket provisioned")
+            checks+=("pods_total=0|warn|no tytus pods have this bucket provisioned (no sidecar — legacy bind)")
         fi
     fi
 

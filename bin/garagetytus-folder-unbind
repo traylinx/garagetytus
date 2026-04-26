@@ -110,6 +110,28 @@ note "target local=${LOCAL_PATH}"
 [[ "${#matched_buckets[@]}" -gt 0 ]] && note "matched buckets: ${matched_buckets[*]}"
 [[ "$DRY_RUN" -eq 1 ]] && note "DRY-RUN — no changes"
 
+# Resolve --deprovision-pods auto BEFORE phase 1 wipes the sidecar.
+# Sidecar is in WORKDIR_BASE/<safe-name>.bindings.json; phase 1 deletes
+# it as part of removing the plist+workdir, so we must read it first.
+if [[ "$DEPROVISION_PODS" == "auto" ]]; then
+    declare -a auto_pods=()
+    for safe_name in "${matched_safe_names[@]}"; do
+        sidecar="${WORKDIR_BASE}/${safe_name}.bindings.json"
+        if [[ -f "$sidecar" ]]; then
+            while IFS= read -r p; do
+                [[ -n "$p" ]] && auto_pods+=("$p")
+            done < <(jq -r '.pods_provisioned[]?' "$sidecar")
+        fi
+    done
+    if [[ "${#auto_pods[@]}" -eq 0 ]]; then
+        note "--deprovision-pods auto: no sidecar metadata (or no pods provisioned at bind time); will skip phase 2"
+        DEPROVISION_PODS=""
+    else
+        DEPROVISION_PODS=$(IFS=,; printf '%s' "${auto_pods[*]}")
+        note "--deprovision-pods auto resolved to: ${DEPROVISION_PODS}"
+    fi
+fi
+
 run_droplet() {
     if [[ "$DRY_RUN" -eq 1 ]]; then
         printf 'DRY: ssh %s %s\n' "$DROPLET" "$*" >&2; return 0
@@ -133,11 +155,14 @@ for i in "${!matched_plists[@]}"; do
         rm -f "$plist"
         rm -rf "${WORKDIR_BASE}/${safe_name}"
         rm -f "${LOG_BASE}-${safe_name}.log" "${LOG_BASE}-${safe_name}.err"
-        note "  removed plist + workdir for ${safe_name}"
+        rm -f "${WORKDIR_BASE}/${safe_name}.bindings.json"
+        note "  removed plist + workdir + sidecar for ${safe_name}"
     fi
 done
 
 # ── 2. (optional) deprovision named pods ───────────────────────────
+# `--deprovision-pods auto` was resolved to an explicit pod list at the
+# top of this script (BEFORE phase 1 wiped the sidecar).
 note "phase 2/5 — deprovision pods (--deprovision-pods)"
 if [[ -n "$DEPROVISION_PODS" ]]; then
     [[ -x "$DEPROVISION_SCRIPT" ]] || err "missing ${DEPROVISION_SCRIPT}"
