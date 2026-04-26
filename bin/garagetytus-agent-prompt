@@ -2,6 +2,16 @@
 # garagetytus-agent-prompt — emit a paste-ready agent chat prompt
 # for a granted bucket on a remote garagetytus daemon.
 #
+# ⚠️  v0.5.1 NOTE: This is the break-glass / manual override path.
+# The default path is now `garagetytus folder bind --to <pod>`
+# which provisions credentials INTO the pod (no chat-paste). Use
+# this script only when:
+#   - bootstrapping a fresh agent runtime that doesn't know about
+#     `garagetytus-shared`
+#   - debugging `garagetytus-pod-provision` failures
+#   - integrating a non-tytus environment (Linux laptop, second
+#     Mac) where the pod-provision script doesn't apply
+#
 # Pastes into Claude Code / ChatGPT / OpenClaw / Hermes / etc.
 # running inside (or alongside) a tytus pod, so the agent knows
 # what bucket it has access to, what its identity is, what

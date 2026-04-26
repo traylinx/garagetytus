@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # garagetytus-agent-probe — emit a probe prompt that asks an
 # agent in a tytus pod to demonstrate it knows how to use the
-# shared file system. Paste into the chat window AFTER
-# `garagetytus-agent-prompt` has been pasted.
+# shared file system.
+#
+# ⚠️  v0.5.1 NOTE: With `garagetytus folder bind --to <pod>`, the
+# agent already knows `garagetytus-shared list / put / get` from
+# the system-prompt fragment provisioned into nemoclaw. This
+# probe is the BREAK-GLASS verification path — pair with
+# `garagetytus-agent-prompt` (also break-glass) when the
+# pod-provision flow isn't available.
 #
 # Usage:
 #   garagetytus-agent-probe [--bucket NAME] [--multi] [--live] [--copy]

@@ -436,22 +436,92 @@ of `<log_dir>/garagetytus.log`.
 
 ---
 
-## 12. Shared folders across Mac + tytus pods (v0.5.0)
+## 12. Shared folders across Mac + tytus pods (v0.5.1)
 
-> **Headline.** v0.5.0 ships **shared S3 buckets across Mac
-> and any tytus pod**, with `rclone bisync` as the
-> reference folder-sync wrapper. The droplet runs single-node
-> Garage (rf=1); Mac and pods are S3 *clients* over WireGuard.
-> Mac↔pod file round-trip is verified end-to-end.
+> **Headline.** v0.5.1 ships the **zero-touch UX**: one Mac
+> command (`garagetytus folder bind`) creates a bucket on the
+> droplet, mints a per-pod credential for each named tytus
+> pod, drops the `garagetytus-shared` Python wrapper into the
+> pod, appends a 5-line system-prompt fragment to the pod's
+> nemoclaw config so the agent already-knows how to use the
+> bucket, and starts a launchd-managed bisync between a Mac
+> folder and the bucket. **No copy-paste of credentials, no
+> per-pod chat ceremony.**
 
-### What works in v0.5.0
+### v0.5.1 zero-touch path (use this)
+
+```bash
+# One Mac command sets up everything: bucket + Mac<->droplet sync
+# + pod credentials + agent system-prompt + auto-sync polling.
+garagetytus folder bind ~/Documents/work testbucket \
+    --to 02 --to 04 --auto-sync
+
+# Drop a file in ~/Documents/work and walk away.
+# Within 60s, every named pod can read it via:
+#   garagetytus-shared get <key> <local-path>
+# Pods write via:
+#   garagetytus-shared put <local-file>
+# Agents see a 5-line fragment in their system prompt
+# explaining the wrapper exists. They never see access keys.
+```
+
+What `folder bind` does in 6 idempotent phases:
+
+| Phase | Action |
+|---|---|
+| 1 | `garage bucket create <bucket>` if absent |
+| 2 | Reuse existing `[garagetytus]` rclone remote's key (or mint a fresh `mac-shared` key + write a new remote) |
+| 3 | `garage bucket allow --read --write <bucket> --key <key>` |
+| 4 | `mkdir -p` + `.garagetytus-bound` marker + `rclone bisync --resync` |
+| 5 | LaunchAgent plist with `StartInterval=60` + `timeout 45` rclone wrapper (only with `--auto-sync`) |
+| 6 | `garagetytus-pod-provision <pod> --bucket <bucket>` for each `--to` pod |
+
+Per-pod provision (phase 6) does its own 6 phases: mints
+`pod-<pod-id>-<bucket>` Garage key, drops wrapper + creds +
+audit into `/app/workspace/.garagetytus/`, appends
+shared-folder fragment to `agents.defaults.systemPromptOverride`
+in nemoclaw `config.user.json` with idempotent marker
+`<!-- garagetytus:shared-folders v1 -->`, restarts the
+container.
+
+To revoke a pod's access without taking down the folder:
+
+```bash
+garagetytus-pod-deprovision 04 --bucket testbucket   # one bucket
+garagetytus-pod-deprovision 04 --all-buckets         # all
+```
+
+To inspect what's currently bound on the Mac:
+
+```bash
+launchctl list | grep com.traylinx.garagetytus.bisync
+ls ~/.cache/garagetytus/bisync/
+```
+
+**Q14 verdict (lope pi+codex parallel, 2026-04-26):** the
+launchd plist uses polling-only (`StartInterval=60`) with a
+`timeout 45` wrapper around rclone. NO `WatchPaths`, NO
+`KeepAlive` — both were tried in v0.5.0 and hung
+indefinitely on transient WG blips. Worst-case latency: 60
+seconds per direction, in exchange for very high reliability.
+Multi-folder Rust daemon is the v0.6 path when 5+ pods
+demand sub-minute latency.
+
+### What works in v0.5.1
+
+### What works in v0.5.1
 
 | Surface | State |
 |---|---|
-| Pod ↔ pod via the droplet's bucket | ✅ verified PUT/LIST/GET |
-| Mac ↔ droplet's bucket (Mac is S3 client over WG) | ✅ verified PUT/GET |
-| Mac ↔ pod folder sync (drop a file in Mac, pod sees it) | ✅ via `rclone bisync` |
-| `garagetytus bucket create / grant` orchestration | ✅ via Mac's `garage --rpc-host …` against droplet daemon |
+| `garagetytus folder bind` (one Mac command) | ✅ ships idempotent + auto-sync |
+| `garagetytus-pod-provision` / `garagetytus-pod-deprovision` | ✅ per-pod credential lifecycle |
+| Per-pod credential isolation (one Garage key per pod-bucket pair) | ✅ Q11 verdict |
+| Pod-side `garagetytus-shared` Python wrapper | ✅ list / put / get / rm / buckets / whoami |
+| Auto-append shared-folder fragment to nemoclaw systemPromptOverride | ✅ idempotent marker (Q12) |
+| Auto-sync via launchd polling, no WatchPaths | ✅ Q14 Option 1 verdict |
+| Pod ↔ pod via the droplet's bucket (carry-over) | ✅ verified PUT/LIST/GET |
+| Mac ↔ droplet's bucket (carry-over) | ✅ verified PUT/GET |
+| Manual chat-paste recipe (carry-over, see Manual override below) | ✅ kept for break-glass |
 
 ### Architecture — the simple version
 
@@ -485,6 +555,23 @@ of `<log_dir>/garagetytus.log`.
 - **Single-node Garage (rf=1).** No cluster peering. The
   v0.6 backlog includes 2-node replicated clusters via an
   upstream Garage patch (see Q10 in the sprint dir).
+
+---
+
+### Manual override path (v0.5.0 recipe — break-glass only)
+
+> The sections below describe the v0.5.0 manual recipe: hand-edit
+> `~/.config/rclone/rclone.conf`, `ssh root@<droplet>` to mint
+> grants, paste credentials into agent chat windows. This is
+> **superseded by `garagetytus folder bind`** above and is kept
+> only for: (a) debugging when the wrapper misbehaves, (b)
+> bootstrapping the very first bucket on a fresh droplet, (c)
+> integrating with non-tytus environments where the bash
+> helpers don't apply.
+>
+> If you find yourself reaching for this path during normal
+> operations, file an issue — the zero-touch path should cover
+> your workflow.
 
 ### Mac side — install and configure rclone
 
@@ -669,15 +756,25 @@ the four `ssh + rclone` commands above are the manual recipe.
 
 ### Roadmap reference
 
-- v0.5.0 (this release) — shared buckets via S3 client tier;
-  manual `bucket create` + `bucket grant` + rclone bisync;
-  pod-side `garagetytus.shared.json` manifest convention.
-- v0.5.1 — `garagetytus folder bind <local-path> <bucket> --to <pods>`:
-  one command does bucket create + grants + rclone config +
-  launchd plist + per-pod manifest distribution. SSH credential
-  fetch into Mac keychain.
-- v0.6 — symmetric 2-node replicated cluster (Garage netapp
-  patch per Q10). Unblocks rf=2 HA mode if anyone needs it.
+- v0.5.0 — shared buckets via S3 client tier; manual `bucket
+  create` + `bucket grant` + rclone bisync; pod-side
+  `garagetytus.shared.json` manifest convention. *(carry-over
+  recipes preserved as Manual override above.)*
+- **v0.5.1 (this release)** — `garagetytus folder bind` one-Mac-
+  command setup, `garagetytus-pod-{,de}provision` per-pod
+  credential lifecycle, pod-side `garagetytus-shared` Python
+  wrapper (zero chat-paste), launchd polling auto-sync (Q14
+  Option 1), idempotent system-prompt fragment append (Q12),
+  per-pod Garage key isolation (Q11), revoke-on-disconnect
+  (Q13).
+- v0.5.2 — `tytus connect --bucket B` flag (one-line shell-out
+  to `garagetytus-pod-provision`); `garagetytus folder unbind`
+  + `folder list` + `folder status`; cred refresh / TTL
+  rotation daemon.
+- v0.6 — Rust daemon owning all bisync invocations (replaces N
+  per-folder launchd plists with one supervisor); symmetric
+  2-node replicated cluster (Garage netapp patch per Q10);
+  `garagetytus mount` FUSE option for sub-second latency users.
 
 ---
 

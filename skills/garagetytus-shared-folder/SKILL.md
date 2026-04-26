@@ -34,6 +34,47 @@ any environment with WireGuard access to the shared S3 endpoint),
 how to share files with the user and with agents in other pods
 through buckets on the droplet.
 
+## v0.5.1 default path: use `garagetytus-shared`
+
+If `/app/workspace/.garagetytus/garagetytus-shared` exists in
+your pod, that is the **only** thing you need. The Mac-side
+`garagetytus folder bind` flow has already minted your pod's
+credentials, dropped them at
+`/app/workspace/.garagetytus/credentials.json`, and appended a
+fragment to your system prompt. Use the wrapper:
+
+```bash
+garagetytus-shared buckets                            # what you have access to
+garagetytus-shared whoami                             # your pod identity + audit
+garagetytus-shared list                               # default bucket
+garagetytus-shared list --bucket work --prefix from-mac/
+garagetytus-shared put ./report.md                    # auto-keyed: from-<pod-id>/report.md
+garagetytus-shared put ./report.md --key meeting/2026-04-26.md
+garagetytus-shared get from-mac/agenda.md /tmp/agenda.md
+garagetytus-shared rm from-<pod-id>/old-file.md --yes
+```
+
+The wrapper picks the right bucket if you omit `--bucket` (the
+default-marked bucket in your credentials), uses path-style
+addressing, retries up to 3x, and prints clear error messages
+if endpoint or credentials fail. **You never see access keys.**
+
+If the wrapper isn't installed, ask Sebastian to run on his Mac:
+
+```bash
+garagetytus folder bind ~/Documents/<topic> <bucket> --to <your-pod-id>
+```
+
+That sets up everything. Then come back here.
+
+The rest of this skill — the `aws CLI`, `boto3`, `/etc/garagetytus.env`
+recipes — describes the **v0.5.0 manual fallback path**. Use those
+only when the wrapper genuinely doesn't exist (very old pod images
+or non-tytus environments). For all normal work in v0.5.1+, the
+wrapper above is the answer.
+
+---
+
 ## Mental model — one bucket = one shared folder
 
 ```
