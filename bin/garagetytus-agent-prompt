@@ -13,6 +13,11 @@
 # Options:
 #   --bucket NAME        bucket name, e.g. "work" or "shared"             [required]
 #   --pod ID             pod identity, e.g. "wannolot-02"                 [required]
+#   --style boto3|aws-cli|both
+#                        which client recipes to embed in the prompt.
+#                        Default: boto3 (empirically what tytus pods have).
+#                        Use aws-cli for Mac-side agents or pod images that
+#                        ship awscli. "both" emits both for max flexibility.
 #   --droplet HOST       SSH host for `garagetytus bucket grant` lookup
 #                        (default: env GARAGETYTUS_DROPLET, else fail)
 #   --endpoint URL       S3 endpoint exposed to the pod
@@ -38,6 +43,7 @@ set -euo pipefail
 
 BUCKET=""
 POD=""
+STYLE="boto3"
 DROPLET="${GARAGETYTUS_DROPLET:-}"
 ENDPOINT="http://10.42.42.1:3900"
 ACCESS_KEY=""
@@ -47,12 +53,13 @@ COPY=0
 NO_GRANT=0
 
 err() { printf 'garagetytus-agent-prompt: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '1,40p' "$0" | sed 's|^# \{0,1\}||'; }
+usage() { sed -n '1,45p' "$0" | sed 's|^# \{0,1\}||'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --bucket)     BUCKET="$2";     shift 2;;
         --pod)        POD="$2";        shift 2;;
+        --style)      STYLE="$2";      shift 2;;
         --droplet)    DROPLET="$2";    shift 2;;
         --endpoint)   ENDPOINT="$2";   shift 2;;
         --access-key) ACCESS_KEY="$2"; shift 2;;
@@ -64,6 +71,11 @@ while [[ $# -gt 0 ]]; do
         *)            err "unknown flag: $1 (try --help)";;
     esac
 done
+
+case "$STYLE" in
+    boto3|aws-cli|both) ;;
+    *) err "--style must be boto3 | aws-cli | both (got: $STYLE)";;
+esac
 
 [[ -z "$BUCKET" ]] && err "--bucket is required"
 [[ -z "$POD" ]]    && err "--pod is required"
@@ -92,11 +104,11 @@ if [[ -z "$ACCESS_KEY" || -z "$SECRET_KEY" ]]; then
     fi
 fi
 
-# Emit the paste-ready prompt.
-prompt="$(cat <<EOF
+# Build the prompt body for each style; concatenate per --style.
+header="$(cat <<EOF
 You have access to a shared file system through a Garage S3
-bucket on Sebastian's droplet. Use this when you need to save a
-file Sebastian (or another pod) will see, or read a file
+bucket on Sebastian's droplet. Use this when you need to save
+a file Sebastian (or another pod) will see, or read a file
 they've added for you.
 
 ENDPOINT:    $ENDPOINT
@@ -105,28 +117,78 @@ YOUR ID:     $POD
 ACCESS KEY:  $ACCESS_KEY
 SECRET KEY:  $SECRET_KEY
 REGION:      garage
+EOF
+)"
+
+boto3_block="$(cat <<EOF
+NOTE: This pod has boto3 (Python) installed but NOT the aws CLI.
+Use the Python recipes below — do not invent aws-cli commands.
 
 # How to PUT a file (Sebastian or other pods will see it):
-aws s3 cp ./your-file.md s3://$BUCKET/from-$POD/your-file.md \\
-    --endpoint $ENDPOINT \\
-    --region garage \\
-    --profile garagetytus
+python3 - <<'PY'
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3",
+    endpoint_url="$ENDPOINT",
+    aws_access_key_id="$ACCESS_KEY",
+    aws_secret_access_key="$SECRET_KEY",
+    region_name="garage", config=Config(s3={"addressing_style": "path"}))
+with open("./your-file.md", "rb") as f:
+    s3.put_object(Bucket="$BUCKET",
+                  Key="from-$POD/your-file.md",
+                  Body=f.read())
+print("OK")
+PY
 
 # How to LIST what's in the bucket:
-aws s3 ls s3://$BUCKET/ --recursive \\
-    --endpoint $ENDPOINT \\
-    --region garage --profile garagetytus
+python3 - <<'PY'
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3", endpoint_url="$ENDPOINT",
+    aws_access_key_id="$ACCESS_KEY",
+    aws_secret_access_key="$SECRET_KEY",
+    region_name="garage", config=Config(s3={"addressing_style": "path"}))
+for obj in s3.list_objects_v2(Bucket="$BUCKET").get("Contents", []):
+    print(f"{obj['Key']:50} {obj['Size']:>8} bytes")
+PY
 
 # How to GET a file Sebastian sent you:
-aws s3 cp s3://$BUCKET/from-mac/instructions.md ./ \\
-    --endpoint $ENDPOINT \\
-    --region garage --profile garagetytus
+python3 - <<'PY'
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3", endpoint_url="$ENDPOINT",
+    aws_access_key_id="$ACCESS_KEY",
+    aws_secret_access_key="$SECRET_KEY",
+    region_name="garage", config=Config(s3={"addressing_style": "path"}))
+data = s3.get_object(Bucket="$BUCKET",
+                     Key="from-mac/instructions.md")["Body"].read()
+open("./instructions.md", "wb").write(data)
+print(f"got {len(data)} bytes")
+PY
+EOF
+)"
 
-# First-time profile setup (run once per pod):
+awscli_block="$(cat <<EOF
+# First-time profile setup (run once):
 aws configure set aws_access_key_id "$ACCESS_KEY" --profile garagetytus
 aws configure set aws_secret_access_key "$SECRET_KEY" --profile garagetytus
 aws configure set region garage --profile garagetytus
 
+# How to PUT a file (Sebastian or other pods will see it):
+aws s3 cp ./your-file.md s3://$BUCKET/from-$POD/your-file.md \\
+    --endpoint $ENDPOINT --profile garagetytus
+
+# How to LIST what's in the bucket:
+aws s3 ls s3://$BUCKET/ --recursive \\
+    --endpoint $ENDPOINT --profile garagetytus
+
+# How to GET a file Sebastian sent you:
+aws s3 cp s3://$BUCKET/from-mac/instructions.md ./ \\
+    --endpoint $ENDPOINT --profile garagetytus
+EOF
+)"
+
+footer="$(cat <<EOF
 NAMING CONVENTION inside this bucket:
 - Files YOU produce → prefix with from-$POD/
   e.g. s3://$BUCKET/from-$POD/result.json
@@ -144,11 +206,17 @@ WHEN UNSURE which bucket to use, or whether something belongs
 in S3 vs Brain, ASK SEBASTIAN. Don't guess — wrong bucket =
 wrong audience.
 
-If the endpoint refuses connections (\`dial tcp $ENDPOINT:
-connection refused\`), the WireGuard tunnel or the droplet
-forwarder is down. Tell Sebastian; don't loop on retries.
+If the endpoint refuses connections, tell Sebastian; don't
+loop on retries.
 EOF
 )"
+
+case "$STYLE" in
+    boto3)   prompt=$'\n'"$header"$'\n\n'"$boto3_block"$'\n\n'"$footer"$'\n' ;;
+    aws-cli) prompt=$'\n'"$header"$'\n\n'"$awscli_block"$'\n\n'"$footer"$'\n' ;;
+    both)    prompt=$'\n'"$header"$'\n\n--- boto3 (Python) recipes (use these in tytus pods) ---\n\n'"$boto3_block"$'\n\n--- aws CLI recipes (use these in environments with aws CLI) ---\n\n'"$awscli_block"$'\n\n'"$footer"$'\n' ;;
+esac
+prompt="${prompt#?}"  # trim leading newline
 
 if [[ "$COPY" -eq 1 ]]; then
     if command -v pbcopy >/dev/null 2>&1; then

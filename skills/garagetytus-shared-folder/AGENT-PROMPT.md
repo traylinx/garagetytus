@@ -28,10 +28,16 @@ That's it. The agent now has the recipe for sharing files.
 
 ## Template — copy from here ↓↓↓
 
+> **Tytus pods ship boto3 (Python) but NOT the aws CLI.** This
+> template uses boto3 because that's what actually works in the
+> pod environment. If your target environment has the aws CLI
+> (e.g. you're pasting this into a chat for a Mac-side agent),
+> see the alternative aws-CLI block below.
+
 ```
 You have access to a shared file system through a Garage S3
-bucket on Sebastian's droplet. Use this when you need to save a
-file Sebastian (or another pod) will see, or read a file
+bucket on Sebastian's droplet. Use this when you need to save
+a file Sebastian (or another pod) will see, or read a file
 they've added for you.
 
 ENDPOINT:    http://10.42.42.1:3900
@@ -41,34 +47,55 @@ ACCESS KEY:  <access-key-id>
 SECRET KEY:  <secret-access-key>
 REGION:      garage
 
+NOTE: This pod has boto3 (Python) installed but NOT the aws CLI.
+Use the Python recipes below — do not invent aws-cli commands.
+
 # How to PUT a file (Sebastian or other pods will see it):
-aws s3 cp ./your-file.md s3://<bucket-name>/from-<pod-name>/your-file.md \
-    --endpoint http://10.42.42.1:3900 \
-    --region garage \
-    --profile garagetytus
+python3 - <<'PY'
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3",
+    endpoint_url="http://10.42.42.1:3900",
+    aws_access_key_id="<access-key-id>",
+    aws_secret_access_key="<secret-access-key>",
+    region_name="garage", config=Config(s3={"addressing_style": "path"}))
+with open("./your-file.md", "rb") as f:
+    s3.put_object(Bucket="<bucket-name>",
+                  Key="from-<pod-name>/your-file.md",
+                  Body=f.read())
+print("OK")
+PY
 
 # How to LIST what's in the bucket:
-aws s3 ls s3://<bucket-name>/ --recursive \
-    --endpoint http://10.42.42.1:3900 \
-    --region garage --profile garagetytus
+python3 - <<'PY'
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3", endpoint_url="http://10.42.42.1:3900",
+    aws_access_key_id="<access-key-id>",
+    aws_secret_access_key="<secret-access-key>",
+    region_name="garage", config=Config(s3={"addressing_style": "path"}))
+for obj in s3.list_objects_v2(Bucket="<bucket-name>").get("Contents", []):
+    print(f"{obj['Key']:50} {obj['Size']:>8} bytes")
+PY
 
 # How to GET a file Sebastian sent you:
-aws s3 cp s3://<bucket-name>/from-mac/instructions.md ./ \
-    --endpoint http://10.42.42.1:3900 \
-    --region garage --profile garagetytus
-
-# First-time profile setup (run once per pod):
-aws configure set aws_access_key_id "<access-key-id>" --profile garagetytus
-aws configure set aws_secret_access_key "<secret-access-key>" --profile garagetytus
-aws configure set region garage --profile garagetytus
+python3 - <<'PY'
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3", endpoint_url="http://10.42.42.1:3900",
+    aws_access_key_id="<access-key-id>",
+    aws_secret_access_key="<secret-access-key>",
+    region_name="garage", config=Config(s3={"addressing_style": "path"}))
+data = s3.get_object(Bucket="<bucket-name>",
+                     Key="from-mac/instructions.md")["Body"].read()
+open("./instructions.md", "wb").write(data)
+print(f"got {len(data)} bytes")
+PY
 
 NAMING CONVENTION inside this bucket:
 - Files YOU produce → prefix with from-<pod-name>/
-  e.g. s3://<bucket-name>/from-<pod-name>/result.json
 - Files Sebastian sent you → look in from-mac/
-  e.g. s3://<bucket-name>/from-mac/instructions.md
 - Files for ALL pods in this bucket → prefix with broadcast/
-  e.g. s3://<bucket-name>/broadcast/2026-04-26-news.md
 
 WHAT NOT TO PUT IN THIS BUCKET:
 - Secrets / API keys / passwords (this bucket is shared)
@@ -79,10 +106,51 @@ WHEN UNSURE which bucket to use, or whether something belongs
 in S3 vs Brain, ASK SEBASTIAN. Don't guess — wrong bucket =
 wrong audience.
 
-If the endpoint refuses connections (`dial tcp 10.42.42.1:3900:
-connection refused`), the WireGuard tunnel or the droplet
-forwarder is down. Tell Sebastian; don't loop on retries.
+If the endpoint refuses connections, tell Sebastian; don't
+loop on retries.
 ```
+
+## Alternative — aws CLI flavor (Mac-side agents, custom pods)
+
+If the target has the aws CLI installed (e.g. a Mac-side agent,
+or a pod image that ships awscli), use this block instead. Same
+substitutions: `<bucket-name>`, `<pod-name>`, `<access-key-id>`,
+`<secret-access-key>`.
+
+```
+ENDPOINT:    http://10.42.42.1:3900
+BUCKET:      <bucket-name>
+YOUR ID:     <pod-name>
+ACCESS KEY:  <access-key-id>
+SECRET KEY:  <secret-access-key>
+REGION:      garage
+
+# First-time profile setup (run once):
+aws configure set aws_access_key_id "<access-key-id>" --profile garagetytus
+aws configure set aws_secret_access_key "<secret-access-key>" --profile garagetytus
+aws configure set region garage --profile garagetytus
+
+# PUT:
+aws s3 cp ./your-file.md s3://<bucket-name>/from-<pod-name>/your-file.md \
+    --endpoint http://10.42.42.1:3900 --profile garagetytus
+
+# LIST:
+aws s3 ls s3://<bucket-name>/ --recursive \
+    --endpoint http://10.42.42.1:3900 --profile garagetytus
+
+# GET:
+aws s3 cp s3://<bucket-name>/from-mac/instructions.md ./ \
+    --endpoint http://10.42.42.1:3900 --profile garagetytus
+
+(naming + DO-NOT rules same as the boto3 block above)
+```
+
+Why two flavors: empirically, tytus pods (NemoClaw image) have
+boto3 installed but NOT the aws CLI, AND `/etc/` is read-only
+so we can't `aws configure` to drop credentials there. The
+boto3 block gives the agent everything inline so no filesystem
+writes are needed. The aws-CLI block exists for environments
+where the operator has installed it deliberately.
 
 ## Multiple buckets — paste once per bucket
 

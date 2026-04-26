@@ -4,20 +4,36 @@ If you're an AI agent running inside a tytus pod (OpenClaw,
 Hermes, or any other pod runtime) and you need to share files
 with the user's Mac or with agents in other pods, this is how.
 
-## TL;DR
+## TL;DR — use boto3 (Python) by default
 
-```bash
-. /etc/garagetytus.env
-BUCKET=work    # ← which shared folder this file belongs in (ask if unsure)
-POD=$(hostname)
-aws s3 cp ./your-file.md s3://$BUCKET/from-$POD/$(basename your-file.md) \
-    --endpoint $GARAGETYTUS_S3_ENDPOINT \
-    --region garage --profile s3-service
+Tytus pods ship `boto3` but NOT the `aws` CLI, AND `/etc/` is
+read-only so credentials must be inlined where the agent uses
+them. Use Python directly:
+
+```python
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3",
+    endpoint_url="http://10.42.42.1:3900",
+    aws_access_key_id="<GK…>",          # from setup prompt
+    aws_secret_access_key="<…>",
+    region_name="garage", config=Config(s3={"addressing_style": "path"}))
+s3.put_object(Bucket="<bucket>",
+              Key=f"from-<pod-id>/your-file.md",
+              Body=open("./your-file.md", "rb").read())
 ```
 
 The user's Mac sees it within seconds (or as soon as `rclone
 bisync` runs against that bucket). Other pods granted access to
 the same bucket see it immediately.
+
+If your environment ALSO has `aws` CLI (Mac-side agents, custom
+pod images), the equivalent one-liner is:
+
+```bash
+aws s3 cp ./your-file.md s3://<bucket>/from-<pod-id>/your-file.md \
+    --endpoint http://10.42.42.1:3900 --profile garagetytus
+```
 
 ## One bucket = one shared folder
 
