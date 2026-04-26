@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# garagetytus-refresh-watchdog — walk every running tytus-NN pod,
+# check `_last-provision.json:next_refresh_due`, rotate credentials
+# for any pod within `--threshold-days` (default 7) of expiry.
+#
+# Designed to run as a LaunchAgent on a 24h interval. Output goes
+# to stderr (captured by the LaunchAgent's stderr log).
+#
+# Usage:
+#   garagetytus-refresh-watchdog [--threshold-days N]
+#                                 [--droplet HOST] [--dry-run]
+#
+# Exit code:
+#   0 — no work needed OR rotations succeeded
+#   1 — at least one rotation failed (check logs)
+
+set -euo pipefail
+
+DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+THRESHOLD_DAYS=7
+DRY_RUN=0
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REFRESH_SCRIPT="${SCRIPT_DIR}/garagetytus-pod-refresh"
+
+err() { printf 'refresh-watchdog: %s\n' "$*" >&2; exit 1; }
+note() { printf 'refresh-watchdog: %s\n' "$*" >&2; }
+usage() { sed -n '1,16p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --threshold-days) THRESHOLD_DAYS="$2"; shift 2;;
+        --droplet)        DROPLET="$2"; shift 2;;
+        --dry-run)        DRY_RUN=1; shift;;
+        -h|--help)        usage; exit 0;;
+        *) err "unknown flag: $1 (try --help)";;
+    esac
+done
+
+[[ -x "$REFRESH_SCRIPT" ]] || err "missing ${REFRESH_SCRIPT}"
+
+note "watchdog tick at $(date -u +%Y-%m-%dT%H:%M:%SZ); threshold=${THRESHOLD_DAYS}d"
+
+# Walk running tytus-NN containers
+mapfile -t containers < <(ssh -o BatchMode=yes "$DROPLET" \
+    'docker ps --filter name=tytus- --format "{{.Names}}"' 2>/dev/null)
+
+if [[ "${#containers[@]}" -eq 0 ]]; then
+    note "no running tytus-NN containers found"
+    exit 0
+fi
+
+now_epoch=$(date +%s)
+threshold_sec=$(( THRESHOLD_DAYS * 86400 ))
+fail_count=0
+rotated_count=0
+checked_count=0
+
+for c in "${containers[@]}"; do
+    audit=$(ssh -o BatchMode=yes "$DROPLET" \
+        "docker exec ${c} cat /app/workspace/.garagetytus/_last-provision.json 2>/dev/null || echo '{}'" \
+        2>/dev/null)
+    [[ "$audit" == "{}" ]] && continue
+    checked_count=$(( checked_count + 1 ))
+
+    next_due_iso=$(printf '%s' "$audit" | jq -r '.next_refresh_due // ""')
+    if [[ -z "$next_due_iso" ]]; then
+        note "  ${c}: no next_refresh_due in audit — rotating to set it"
+        next_due_epoch=0
+    else
+        # macOS date parses ISO8601 with -j -f
+        next_due_epoch=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$next_due_iso" +%s 2>/dev/null \
+            || date -u -d "$next_due_iso" +%s 2>/dev/null \
+            || echo 0)
+    fi
+
+    delta=$(( next_due_epoch - now_epoch ))
+    if [[ "$delta" -le "$threshold_sec" ]]; then
+        if [[ "$delta" -le 0 ]]; then
+            note "  ${c}: refresh OVERDUE (was ${next_due_iso:-?}) — rotating now"
+        else
+            note "  ${c}: due in $(( delta / 86400 ))d — within ${THRESHOLD_DAYS}d threshold, rotating"
+        fi
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            note "    dry: would call ${REFRESH_SCRIPT} ${c#tytus-}"
+            rotated_count=$(( rotated_count + 1 ))
+        else
+            if "$REFRESH_SCRIPT" "${c#tytus-}" --droplet "$DROPLET" 2>&1 \
+                    | sed 's/^/    /'; then
+                rotated_count=$(( rotated_count + 1 ))
+            else
+                note "  ${c}: refresh FAILED"
+                fail_count=$(( fail_count + 1 ))
+            fi
+        fi
+    else
+        note "  ${c}: due in $(( delta / 86400 ))d — outside ${THRESHOLD_DAYS}d threshold, skipping"
+    fi
+done
+
+note "watchdog done: checked=${checked_count} rotated=${rotated_count} failed=${fail_count}"
+[[ "$fail_count" -gt 0 ]] && exit 1
+exit 0

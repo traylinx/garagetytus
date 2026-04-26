@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# garagetytus-refresh-watchdog-install — register the refresh watchdog
+# as a LaunchAgent on this Mac. Polls every 24h.
+#
+# Usage:
+#   garagetytus-refresh-watchdog-install [--interval-hours N] [--uninstall]
+
+set -euo pipefail
+
+INTERVAL_HOURS=24
+UNINSTALL=0
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+PLIST_LABEL="com.traylinx.garagetytus.refresh-watchdog"
+PLIST_PATH="${PLIST_DIR}/${PLIST_LABEL}.plist"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WATCHDOG_SCRIPT="${SCRIPT_DIR}/garagetytus-refresh-watchdog"
+LOG_OUT="/tmp/garagetytus-refresh-watchdog.log"
+LOG_ERR="/tmp/garagetytus-refresh-watchdog.err"
+
+usage() { sed -n '1,11p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --interval-hours) INTERVAL_HOURS="$2"; shift 2;;
+        --uninstall)      UNINSTALL=1; shift;;
+        -h|--help)        usage; exit 0;;
+        *) echo "unknown flag: $1 (try --help)" >&2; exit 1;;
+    esac
+done
+
+[[ -x "$WATCHDOG_SCRIPT" ]] || { echo "missing ${WATCHDOG_SCRIPT}" >&2; exit 1; }
+mkdir -p "$PLIST_DIR"
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    rm -f "$PLIST_PATH"
+    echo "uninstalled ${PLIST_LABEL}"
+    exit 0
+fi
+
+interval_sec=$(( INTERVAL_HOURS * 3600 ))
+cat > "$PLIST_PATH" <<PLEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>bash</string>
+    <string>-c</string>
+    <string>/usr/local/bin/timeout 600 ${WATCHDOG_SCRIPT}</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>${interval_sec}</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${LOG_OUT}</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_ERR}</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+PLEOF
+
+launchctl unload "$PLIST_PATH" 2>/dev/null || true
+launchctl load "$PLIST_PATH"
+echo "installed ${PLIST_LABEL} (interval ${INTERVAL_HOURS}h, log ${LOG_ERR})"

@@ -491,7 +491,46 @@ garagetytus-pod-deprovision 04 --bucket testbucket   # one bucket
 garagetytus-pod-deprovision 04 --all-buckets         # all
 ```
 
-To inspect what's currently bound on the Mac:
+### Lifecycle commands (v0.5.2)
+
+Inspect, change, or tear down a binding without writing rclone or
+launchctl by hand:
+
+```bash
+# All bindings — table or JSON
+garagetytus folder list
+garagetytus folder list --json
+
+# Per-binding health probe (exit 0 OK / 1 degraded / 2 no bindings)
+garagetytus folder status                       # all
+garagetytus folder status ~/Documents/work      # one
+garagetytus folder status --check-pods --json   # incl. per-pod cred check
+
+# Tear down. Default is conservative — local files + bucket survive
+# until you opt-in via flags. Idempotent re-run safe.
+garagetytus folder unbind ~/Documents/work
+garagetytus folder unbind ~/Documents/work \
+    --revoke-mac-bucket-allow                   # drop rclone key's bucket allow
+garagetytus folder unbind ~/Documents/work \
+    --deprovision-pods 02,04                    # also deprovision named pods
+garagetytus folder unbind ~/Documents/work \
+    --drop-bucket --remove-local-files          # nuclear
+
+# Tytus-side combo (until tytus-cli adds a native --bucket flag)
+tytus-connect-with-bucket --pod 02 --bucket testbucket --bucket scratch
+
+# Credential rotation — manual or scheduled
+garagetytus-pod-refresh 02                      # rotate one pod now
+garagetytus-refresh-watchdog --threshold-days 7 # one-shot scan
+garagetytus-refresh-watchdog-install            # 24h LaunchAgent
+```
+
+The watchdog walks every running tytus-NN container, reads
+`_last-provision.json` for `next_refresh_due`, and rotates anything
+within the threshold. The pod's wrapper re-reads `credentials.json`
+on every call, so rotation needs no pod restart.
+
+### Quick inspection (no helper required)
 
 ```bash
 launchctl list | grep com.traylinx.garagetytus.bisync
@@ -760,17 +799,21 @@ the four `ssh + rclone` commands above are the manual recipe.
   create` + `bucket grant` + rclone bisync; pod-side
   `garagetytus.shared.json` manifest convention. *(carry-over
   recipes preserved as Manual override above.)*
-- **v0.5.1 (this release)** — `garagetytus folder bind` one-Mac-
-  command setup, `garagetytus-pod-{,de}provision` per-pod
-  credential lifecycle, pod-side `garagetytus-shared` Python
-  wrapper (zero chat-paste), launchd polling auto-sync (Q14
-  Option 1), idempotent system-prompt fragment append (Q12),
-  per-pod Garage key isolation (Q11), revoke-on-disconnect
-  (Q13).
-- v0.5.2 — `tytus connect --bucket B` flag (one-line shell-out
-  to `garagetytus-pod-provision`); `garagetytus folder unbind`
-  + `folder list` + `folder status`; cred refresh / TTL
-  rotation daemon.
+- v0.5.1 — `garagetytus folder bind` one-Mac-command setup,
+  `garagetytus-pod-{,de}provision` per-pod credential lifecycle,
+  pod-side `garagetytus-shared` Python wrapper (zero chat-paste),
+  launchd polling auto-sync (Q14 Option 1), idempotent system-
+  prompt fragment append (Q12), per-pod Garage key isolation
+  (Q11), revoke-on-disconnect (Q13).
+- **v0.5.2 (this release)** — lifecycle commands shipped:
+  `garagetytus-folder-list`, `garagetytus-folder-status`
+  (`--check-pods` walks every tytus-NN container),
+  `garagetytus-folder-unbind` (idempotent, opt-in destruction
+  flags), `tytus-connect-with-bucket` Mac-side wrapper (delays
+  the tytus-cli Rust release until later), credential rotation
+  via `garagetytus-pod-refresh` + `garagetytus-refresh-watchdog`
+  (24h LaunchAgent walks pods, rotates any whose
+  `next_refresh_due` is within `--threshold-days`).
 - v0.6 — Rust daemon owning all bisync invocations (replaces N
   per-folder launchd plists with one supervisor); symmetric
   2-node replicated cluster (Garage netapp patch per Q10);

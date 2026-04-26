@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# garagetytus-folder-status — health probe for one or all folder bindings.
+#
+# Usage:
+#   garagetytus folder status [<local-path>] [--check-pods] [--json]
+#
+# Without <local-path>: probe every registered binding.
+# With <local-path>:    probe only that one.
+# --check-pods: also walk every running tytus-NN container and report
+#               which have credentials.json containing this bucket.
+#
+# Exit code:
+#   0  — every probed binding is healthy
+#   1  — at least one binding is degraded (broken plist, unreachable
+#        bucket, poisoned workdir, missing rclone remote)
+#   2  — no bindings registered to probe
+
+set -euo pipefail
+
+DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+DROPLET_CONFIG="/var/lib/garagetytus/config/garagetytus.toml"
+WANNOLOT_NETNS="wannolot-01"
+RCLONE_REMOTE="garagetytus"
+RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+WORKDIR_BASE="${HOME}/.cache/garagetytus/bisync"
+LOG_BASE="/tmp/garagetytus-bisync"
+
+LOCAL_PATH=""
+CHECK_PODS=0
+JSON=0
+
+err() { printf 'folder-status: %s\n' "$*" >&2; exit 1; }
+note() { printf 'folder-status: %s\n' "$*" >&2; }
+usage() { sed -n '1,17p' "$0" | sed 's|^# \{0,1\}||'; }
+
+if [[ "${1:-}" == "folder" && "${2:-}" == "status" ]]; then shift 2; fi
+if [[ "${1:-}" == "status" ]]; then shift; fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check-pods) CHECK_PODS=1; shift;;
+        --json)       JSON=1; shift;;
+        --droplet)    DROPLET="$2"; shift 2;;
+        -h|--help)    usage; exit 0;;
+        --) shift; break;;
+        -*) err "unknown flag: $1 (try --help)";;
+        *)
+            if [[ -z "$LOCAL_PATH" ]]; then LOCAL_PATH="$1"
+            else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+if [[ -n "$LOCAL_PATH" ]]; then
+    case "$LOCAL_PATH" in
+        /*) ;;
+        ~*) LOCAL_PATH="${LOCAL_PATH/#\~/$HOME}";;
+        *)  LOCAL_PATH="$(pwd)/${LOCAL_PATH}";;
+    esac
+fi
+
+shopt -s nullglob
+all_plists=("${PLIST_DIR}"/com.traylinx.garagetytus.bisync.*.plist)
+shopt -u nullglob
+
+if [[ "${#all_plists[@]}" -eq 0 ]]; then
+    if [[ "$JSON" -eq 1 ]]; then echo '[]'
+    else echo "(no folder bindings registered)" >&2; fi
+    exit 2
+fi
+
+launchctl_cache=$(launchctl list 2>/dev/null \
+    | awk '$3 ~ /^com\.traylinx\.garagetytus\.bisync\./ {print $1" "$2" "$3}')
+
+# Parse the rclone remote's access_key once
+rclone_ak=""
+if [[ -f "$RCLONE_CONF" ]]; then
+    rclone_ak=$(awk -v r="[${RCLONE_REMOTE}]" '
+        $0 == r { in_block=1; next }
+        /^\[/   { in_block=0 }
+        in_block && /^access_key_id/ {
+            sub(/^access_key_id[[:space:]]*=[[:space:]]*/, "")
+            print; exit
+        }' "$RCLONE_CONF")
+fi
+
+# Pod inventory (only when --check-pods)
+declare -a tytus_containers=()
+if [[ "$CHECK_PODS" -eq 1 ]]; then
+    while IFS= read -r c; do
+        [[ -n "$c" ]] && tytus_containers+=("$c")
+    done < <(ssh -o BatchMode=yes "$DROPLET" \
+        'docker ps --filter name=tytus- --format "{{.Names}}"' 2>/dev/null)
+fi
+
+probe_one() {
+    local plist="$1" local_path bucket safe_name label
+    local checks=()  # array of "field=val|status=ok/warn/err|msg"
+    local degraded=0
+
+    label=$(basename "$plist" .plist)
+    safe_name="${label#com.traylinx.garagetytus.bisync.}"
+    local args
+    args=$(plutil -convert json -o - "$plist" 2>/dev/null \
+        | jq -r '.ProgramArguments[3] // ""')
+    [[ -z "$args" ]] && return 0
+    local_path=$(printf '%s' "$args" \
+        | sed -nE 's/.*bisync "([^"]+)" "[a-z0-9_-]+:[^"]+".*/\1/p')
+    bucket=$(printf '%s' "$args" \
+        | sed -nE 's/.*bisync "[^"]+" "[a-z0-9_-]+:([^"]+)".*/\1/p')
+
+    [[ -n "${LOCAL_PATH}" && "$local_path" != "$LOCAL_PATH" ]] && return 0
+
+    # Check 1: launchd job loaded?
+    local probe pid exit_code
+    probe=$(printf '%s\n' "$launchctl_cache" \
+        | awk -v L="$label" '$3==L {print $1" "$2; exit}')
+    if [[ -z "$probe" ]]; then
+        checks+=("plist=loaded|err|launchd job not loaded")
+        degraded=1
+    else
+        pid="${probe%% *}"; exit_code="${probe##* }"
+        if   [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 ]]; then
+            checks+=("plist=loaded|ok|running pid=${pid}")
+        elif [[ "$exit_code" == "0" ]]; then
+            checks+=("plist=loaded|ok|idle, last exit 0")
+        else
+            checks+=("plist=loaded|err|last exit ${exit_code}")
+            degraded=1
+        fi
+    fi
+
+    # Check 2: workdir present + path1 listing not poisoned
+    local workdir="${WORKDIR_BASE}/${safe_name}"
+    if [[ ! -d "$workdir" ]]; then
+        checks+=("workdir=present|warn|missing (will rebuild on next sync)")
+    else
+        local p1
+        p1=$(find "$workdir" -name '*.path1.lst' -size +0c 2>/dev/null | head -1)
+        if [[ -z "$p1" ]]; then
+            checks+=("workdir=path1|err|empty path1.lst (poisoned — drop a marker file)")
+            degraded=1
+        else
+            checks+=("workdir=path1|ok|non-empty")
+        fi
+    fi
+
+    # Check 3: local path exists
+    if [[ -d "$local_path" ]]; then
+        checks+=("local=exists|ok|present")
+    else
+        checks+=("local=exists|err|missing on disk")
+        degraded=1
+    fi
+
+    # Check 4: bucket reachable via rclone
+    if rclone --config "$RCLONE_CONF" lsd "${RCLONE_REMOTE}:${bucket}" \
+            >/dev/null 2>&1; then
+        checks+=("bucket=reachable|ok|rclone listd succeeded")
+    else
+        checks+=("bucket=reachable|err|rclone cannot list ${bucket}")
+        degraded=1
+    fi
+
+    # Check 5: log file recency
+    local err_log="${LOG_BASE}-${safe_name}.err"
+    if [[ -f "$err_log" ]]; then
+        local age_sec
+        age_sec=$(( $(date +%s) - $(stat -f '%m' "$err_log" 2>/dev/null || echo 0) ))
+        if [[ "$age_sec" -lt 600 ]]; then
+            checks+=("sync=recent|ok|${age_sec}s ago")
+        elif [[ "$age_sec" -lt 7200 ]]; then
+            checks+=("sync=recent|warn|$(( age_sec / 60 ))m ago")
+        else
+            checks+=("sync=recent|warn|$(( age_sec / 3600 ))h ago — interval polling may be stuck")
+        fi
+    else
+        checks+=("sync=recent|warn|no log file yet")
+    fi
+
+    # Check 6 (optional): which pods have this bucket provisioned
+    local pods_provisioned=0
+    if [[ "$CHECK_PODS" -eq 1 ]]; then
+        for c in "${tytus_containers[@]}"; do
+            local creds_check
+            creds_check=$(ssh -o BatchMode=yes "$DROPLET" \
+                "docker exec ${c} sh -c 'jq -r \".buckets[].name\" /app/workspace/.garagetytus/credentials.json 2>/dev/null | grep -Fxq ${bucket} && echo PRESENT || echo ABSENT'" \
+                2>/dev/null || echo "ABSENT")
+            if [[ "$creds_check" == *PRESENT* ]]; then
+                checks+=("pod=${c}|ok|bucket provisioned")
+                pods_provisioned=$(( pods_provisioned + 1 ))
+            fi
+        done
+        if [[ "$pods_provisioned" -eq 0 ]]; then
+            checks+=("pods_total=0|warn|no tytus pods have this bucket provisioned")
+        fi
+    fi
+
+    # Emit one row
+    local status_label
+    if [[ "$degraded" -eq 1 ]]; then status_label="DEGRADED"
+    else status_label="OK"; fi
+
+    if [[ "$JSON" -eq 1 ]]; then
+        local checks_json
+        checks_json=$(printf '%s\n' "${checks[@]}" | jq -nR '
+            [inputs | split("|") | {field:.[0], status:.[1], message:.[2]}]')
+        jq -nc \
+            --arg bucket "$bucket" \
+            --arg local "$local_path" \
+            --arg label "$label" \
+            --arg overall "$status_label" \
+            --argjson checks "$checks_json" \
+            '{bucket:$bucket, local_path:$local, label:$label,
+              overall:$overall, checks:$checks}'
+    else
+        printf '\n[%s] %s ↔ %s\n' "$status_label" "$local_path" "$bucket"
+        for c in "${checks[@]}"; do
+            local f="${c%%|*}"; local rest="${c#*|}"
+            local s="${rest%%|*}"; local m="${rest#*|}"
+            local prefix
+            case "$s" in
+                ok)   prefix="  ✓" ;;
+                warn) prefix="  ⚠" ;;
+                err)  prefix="  ✗" ;;
+            esac
+            printf '%s %-22s %s\n' "$prefix" "$f" "$m"
+        done
+    fi
+
+    return $degraded
+}
+
+declare -a json_rows=()
+overall_degraded=0
+matched=0
+for plist in "${all_plists[@]}"; do
+    if [[ "$JSON" -eq 1 ]]; then
+        row=$(probe_one "$plist") || overall_degraded=1
+        if [[ -n "$row" ]]; then
+            json_rows+=("$row")
+            matched=$(( matched + 1 ))
+        fi
+    else
+        if probe_one "$plist"; then :; else overall_degraded=1; fi
+        # Count matches by re-checking the local path filter — minor
+        # duplication but only one plutil call per row total.
+        args=$(plutil -convert json -o - "$plist" 2>/dev/null \
+            | jq -r '.ProgramArguments[3] // ""')
+        [[ -z "$args" ]] && continue
+        plist_local=$(printf '%s' "$args" \
+            | sed -nE 's/.*bisync "([^"]+)" "[a-z0-9_-]+:[^"]+".*/\1/p')
+        if [[ -z "$LOCAL_PATH" || "$plist_local" == "$LOCAL_PATH" ]]; then
+            matched=$(( matched + 1 ))
+        fi
+    fi
+done
+
+if [[ "$JSON" -eq 1 ]]; then
+    printf '%s\n' "${json_rows[@]}" | jq -s '.'
+fi
+
+if [[ "$matched" -eq 0 ]]; then
+    [[ "$JSON" -eq 0 ]] && note "no bindings matched ${LOCAL_PATH:-<all>}"
+    exit 2
+fi
+
+exit "$overall_degraded"

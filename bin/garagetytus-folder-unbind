@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# garagetytus-folder-unbind — undo what `garagetytus folder bind` did.
+#
+# Default behaviour is conservative: stop the auto-sync, remove the
+# launchd plist + workdir, but PRESERVE the local files (it's data),
+# the bucket on the droplet (other pods may still use it), and any
+# per-pod credential provisioning (deprovision pods explicitly).
+#
+# Usage:
+#   garagetytus folder unbind <local-path>
+#                              [--revoke-mac-bucket-allow]
+#                              [--deprovision-pods POD,POD,...]
+#                              [--drop-bucket]
+#                              [--remove-local-files]
+#                              [--launch-agent-dir DIR]
+#                              [--droplet HOST]
+#                              [--dry-run]
+#
+# By default this only stops the sync and removes the launchd job;
+# everything else needs an explicit opt-in flag.
+
+set -euo pipefail
+
+DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+DROPLET_CONFIG="/var/lib/garagetytus/config/garagetytus.toml"
+WANNOLOT_NETNS="wannolot-01"
+RCLONE_REMOTE="garagetytus"
+RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+WORKDIR_BASE="${HOME}/.cache/garagetytus/bisync"
+LOG_BASE="/tmp/garagetytus-bisync"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DEPROVISION_SCRIPT="${SCRIPT_DIR}/garagetytus-pod-deprovision"
+
+LOCAL_PATH=""
+REVOKE_KEY=0
+DEPROVISION_PODS=""
+DROP_BUCKET=0
+REMOVE_LOCAL=0
+DRY_RUN=0
+
+err() { printf 'folder-unbind: %s\n' "$*" >&2; exit 1; }
+note() { printf 'folder-unbind: %s\n' "$*" >&2; }
+usage() { sed -n '1,21p' "$0" | sed 's|^# \{0,1\}||'; }
+
+if [[ "${1:-}" == "folder" && "${2:-}" == "unbind" ]]; then shift 2; fi
+if [[ "${1:-}" == "unbind" ]]; then shift; fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --revoke-mac-bucket-allow) REVOKE_KEY=1; shift;;
+        --deprovision-pods)        DEPROVISION_PODS="$2"; shift 2;;
+        --drop-bucket)             DROP_BUCKET=1; shift;;
+        --remove-local-files)      REMOVE_LOCAL=1; shift;;
+        --launch-agent-dir)        PLIST_DIR="$2"; shift 2;;
+        --droplet)                 DROPLET="$2"; shift 2;;
+        --dry-run)                 DRY_RUN=1; shift;;
+        -h|--help)                 usage; exit 0;;
+        --) shift; break;;
+        -*) err "unknown flag: $1 (try --help)";;
+        *)
+            if [[ -z "$LOCAL_PATH" ]]; then LOCAL_PATH="$1"
+            else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+[[ -n "$LOCAL_PATH" ]] || err "missing <local-path> (try --help)"
+
+# Resolve absolute path (don't require the path to still exist on disk —
+# unbind should work even if the folder was already deleted)
+case "$LOCAL_PATH" in
+    /*) ;;
+    ~*) LOCAL_PATH="${LOCAL_PATH/#\~/$HOME}";;
+    *)  LOCAL_PATH="$(pwd)/${LOCAL_PATH}";;
+esac
+
+# Find the matching plist by parsing ProgramArguments. Multiple binds
+# could in principle reference the same local path with different
+# buckets — collect them all.
+shopt -s nullglob
+all_plists=("${PLIST_DIR}"/com.traylinx.garagetytus.bisync.*.plist)
+shopt -u nullglob
+
+declare -a matched_plists=()
+declare -a matched_buckets=()
+declare -a matched_safe_names=()
+for plist in "${all_plists[@]}"; do
+    args=$(plutil -convert json -o - "$plist" 2>/dev/null \
+        | jq -r '.ProgramArguments[3] // ""')
+    [[ -z "$args" ]] && continue
+    plist_local=$(printf '%s' "$args" \
+        | sed -nE 's/.*bisync "([^"]+)" "[a-z0-9_-]+:[^"]+".*/\1/p')
+    plist_bucket=$(printf '%s' "$args" \
+        | sed -nE 's/.*bisync "[^"]+" "[a-z0-9_-]+:([^"]+)".*/\1/p')
+    if [[ "$plist_local" == "$LOCAL_PATH" ]]; then
+        matched_plists+=("$plist")
+        matched_buckets+=("$plist_bucket")
+        label=$(basename "$plist" .plist)
+        matched_safe_names+=("${label#com.traylinx.garagetytus.bisync.}")
+    fi
+done
+
+if [[ "${#matched_plists[@]}" -eq 0 ]]; then
+    note "no folder bindings registered for ${LOCAL_PATH}"
+    # Idempotent: continue to optional cleanup phases
+fi
+
+note "target local=${LOCAL_PATH}"
+[[ "${#matched_buckets[@]}" -gt 0 ]] && note "matched buckets: ${matched_buckets[*]}"
+[[ "$DRY_RUN" -eq 1 ]] && note "DRY-RUN — no changes"
+
+run_droplet() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf 'DRY: ssh %s %s\n' "$DROPLET" "$*" >&2; return 0
+    fi
+    ssh -o BatchMode=yes "$DROPLET" "$@"
+}
+run_garage() {
+    run_droplet "WPID=\$(docker inspect -f '{{.State.Pid}}' ${WANNOLOT_NETNS}) && \
+                 nsenter -t \$WPID -n -- /root/.local/bin/garage -c ${DROPLET_CONFIG} $*"
+}
+
+# ── 1. unload + remove launchd plists ──────────────────────────────
+note "phase 1/5 — unload + remove launchd plists"
+for i in "${!matched_plists[@]}"; do
+    plist="${matched_plists[$i]}"
+    safe_name="${matched_safe_names[$i]}"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        note "  dry: would unload + rm ${plist}"
+    else
+        launchctl unload "$plist" 2>/dev/null || true
+        rm -f "$plist"
+        rm -rf "${WORKDIR_BASE}/${safe_name}"
+        rm -f "${LOG_BASE}-${safe_name}.log" "${LOG_BASE}-${safe_name}.err"
+        note "  removed plist + workdir for ${safe_name}"
+    fi
+done
+
+# ── 2. (optional) deprovision named pods ───────────────────────────
+note "phase 2/5 — deprovision pods (--deprovision-pods)"
+if [[ -n "$DEPROVISION_PODS" ]]; then
+    [[ -x "$DEPROVISION_SCRIPT" ]] || err "missing ${DEPROVISION_SCRIPT}"
+    IFS=',' read -ra pods <<< "$DEPROVISION_PODS"
+    for pod in "${pods[@]}"; do
+        for bucket in "${matched_buckets[@]}"; do
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                note "  dry: would deprovision pod ${pod} from bucket ${bucket}"
+            else
+                "$DEPROVISION_SCRIPT" "$pod" --bucket "$bucket" --droplet "$DROPLET" \
+                    || note "  WARN: deprovision failed for pod ${pod} bucket ${bucket}"
+            fi
+        done
+    done
+else
+    note "  skipped (no --deprovision-pods)"
+fi
+
+# ── 3. (optional) drop the bucket entirely ─────────────────────────
+# Runs BEFORE the key revoke — emptying the bucket needs the key
+# to still have rw permissions. Dropping the bucket implicitly
+# removes every key's allow on it.
+note "phase 3/5 — drop bucket (--drop-bucket, DESTRUCTIVE)"
+if [[ "$DROP_BUCKET" -eq 1 && "${#matched_buckets[@]}" -gt 0 ]]; then
+    for bucket in "${matched_buckets[@]}"; do
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            note "  dry: would empty + delete bucket ${bucket}"
+        else
+            note "  emptying ${bucket}"
+            rclone --config "$RCLONE_CONF" delete "${RCLONE_REMOTE}:${bucket}" 2>&1 \
+                | sed 's/^/    /' || true
+            sleep 1
+            run_garage "bucket delete --yes ${bucket}" >/dev/null \
+                && note "  deleted bucket ${bucket}" \
+                || note "  WARN: bucket delete returned non-zero"
+        fi
+    done
+elif [[ "$DROP_BUCKET" -eq 1 ]]; then
+    note "  skipped (no buckets matched)"
+else
+    note "  skipped (no --drop-bucket)"
+fi
+
+# ── 4. (optional) revoke Mac key's bucket allow ────────────────────
+# Skipped if --drop-bucket was set — deleting the bucket already
+# removes every key's allow on it, so a separate deny is redundant
+# and would noisily fail with "bucket not found".
+note "phase 4/5 — revoke Mac key bucket allow (--revoke-mac-bucket-allow)"
+if [[ "$REVOKE_KEY" -eq 1 && "$DROP_BUCKET" -eq 1 ]]; then
+    note "  skipped (--drop-bucket already removed all key allows)"
+elif [[ "$REVOKE_KEY" -eq 1 && "${#matched_buckets[@]}" -gt 0 ]]; then
+    if [[ -f "$RCLONE_CONF" ]]; then
+        mac_ak=$(awk -v r="[${RCLONE_REMOTE}]" '
+            $0 == r { in_block=1; next }
+            /^\[/   { in_block=0 }
+            in_block && /^access_key_id/ {
+                sub(/^access_key_id[[:space:]]*=[[:space:]]*/, "")
+                print; exit
+            }' "$RCLONE_CONF")
+    fi
+    if [[ -n "${mac_ak:-}" ]]; then
+        for bucket in "${matched_buckets[@]}"; do
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                note "  dry: would garage bucket deny --read --write ${bucket} --key ${mac_ak}"
+            else
+                run_garage "bucket deny --read --write ${bucket} --key ${mac_ak}" >/dev/null \
+                    && note "  revoked rw on ${bucket} for key ${mac_ak}" \
+                    || note "  WARN: deny failed (perhaps no allow existed)"
+            fi
+        done
+    else
+        note "  WARN: no [garagetytus] rclone remote found; nothing to revoke"
+    fi
+elif [[ "$REVOKE_KEY" -eq 1 ]]; then
+    note "  skipped (no buckets matched)"
+else
+    note "  skipped (no --revoke-mac-bucket-allow)"
+fi
+
+# ── 5. (optional) remove local files ──────────────────────────────
+note "phase 5/5 — remove local files (--remove-local-files, DESTRUCTIVE)"
+if [[ "$REMOVE_LOCAL" -eq 1 && -d "$LOCAL_PATH" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        note "  dry: would rm -rf ${LOCAL_PATH}"
+    else
+        rm -rf "$LOCAL_PATH"
+        note "  removed ${LOCAL_PATH}"
+    fi
+elif [[ "$REMOVE_LOCAL" -eq 1 ]]; then
+    note "  skipped (path doesn't exist)"
+else
+    note "  skipped (no --remove-local-files; local data preserved)"
+fi
+
+note "✅ unbind complete: ${LOCAL_PATH}"

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# tytus-connect-with-bucket — `tytus connect` + auto-provision the
+# named pod for one or more buckets, in one Mac-side command.
+#
+# This is the v0.5.2 ship-shape of "tytus connect --bucket B": a
+# bash wrapper that doesn't require a tytus-cli Rust release. When
+# tytus-cli adds a native `--bucket` flag, this wrapper becomes
+# unnecessary.
+#
+# Usage:
+#   tytus-connect-with-bucket --pod NN --bucket B [--bucket B2 ...]
+#                              [tytus-connect-flags...]
+#
+# Example:
+#   tytus-connect-with-bucket --pod 02 --bucket testbucket --bucket scratch
+#
+# Mechanics:
+#   1. Run `tytus connect --pod NN <other-flags>` and wait for it
+#      to finish (tunnel established).
+#   2. For each --bucket B, run `garagetytus-pod-provision NN --bucket B`.
+#
+# Stops on the first failure (set -e).
+
+set -euo pipefail
+
+POD_ID=""
+BUCKETS=()
+TYTUS_FLAGS=()
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROVISION_SCRIPT="${SCRIPT_DIR}/garagetytus-pod-provision"
+
+err() { printf 'tytus-connect-with-bucket: %s\n' "$*" >&2; exit 1; }
+note() { printf 'tytus-connect-with-bucket: %s\n' "$*" >&2; }
+usage() { sed -n '1,18p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pod|-p)  POD_ID="$2"; TYTUS_FLAGS+=(--pod "$2"); shift 2;;
+        --bucket)  BUCKETS+=("$2"); shift 2;;
+        -h|--help) usage; exit 0;;
+        --) shift; while [[ $# -gt 0 ]]; do TYTUS_FLAGS+=("$1"); shift; done; break;;
+        *) TYTUS_FLAGS+=("$1"); shift;;
+    esac
+done
+
+[[ -n "$POD_ID" ]] || err "missing --pod NN (try --help)"
+[[ "${#BUCKETS[@]}" -gt 0 ]] || err "missing at least one --bucket NAME"
+command -v tytus >/dev/null 2>&1 || err "tytus CLI not on PATH"
+[[ -x "$PROVISION_SCRIPT" ]] || err "missing ${PROVISION_SCRIPT}"
+
+note "phase 1/2 — tytus connect ${TYTUS_FLAGS[*]}"
+tytus connect "${TYTUS_FLAGS[@]}"
+
+note "phase 2/2 — provision pod ${POD_ID} for buckets: ${BUCKETS[*]}"
+provision_args=("$POD_ID")
+for b in "${BUCKETS[@]}"; do provision_args+=(--bucket "$b"); done
+"$PROVISION_SCRIPT" "${provision_args[@]}"
+
+note "✅ connected + provisioned pod ${POD_ID} for ${BUCKETS[*]}"

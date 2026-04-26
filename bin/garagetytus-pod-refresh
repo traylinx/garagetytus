@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# garagetytus-pod-refresh — rotate per-pod-bucket credentials in
+# place, without disturbing the agent or stripping the system-prompt
+# fragment.
+#
+# Reads the pod's existing credentials.json to discover which buckets
+# it has access to, mints fresh keys for each (delete old + create new
+# + bucket allow), rewrites credentials.json on the pod, and updates
+# _last-provision.json with the new next_refresh_due. The wrapper
+# script on the pod re-reads credentials.json on every call, so no
+# pod restart is needed.
+#
+# Usage:
+#   garagetytus-pod-refresh <pod-id> [--droplet HOST] [--dry-run]
+#
+# Idempotent. Safe to re-run. Skips silently if credentials.json
+# is missing (pod isn't provisioned).
+
+set -euo pipefail
+
+DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+DROPLET_CONFIG="/var/lib/garagetytus/config/garagetytus.toml"
+WANNOLOT_NETNS="wannolot-01"
+INTERNAL_ENDPOINT="http://10.42.42.1:3900"
+TYTUS_CLI_VERSION="v0.5.2"
+
+POD_ID=""
+DRY_RUN=0
+
+err() { printf 'pod-refresh: %s\n' "$*" >&2; exit 1; }
+note() { printf 'pod-refresh: %s\n' "$*" >&2; }
+usage() { sed -n '1,17p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --droplet) DROPLET="$2"; shift 2;;
+        --dry-run) DRY_RUN=1; shift;;
+        -h|--help) usage; exit 0;;
+        *)
+            if [[ -z "$POD_ID" ]]; then POD_ID="$1"
+            else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+[[ -n "$POD_ID" ]] || err "missing <pod-id> (try --help)"
+
+case "$POD_ID" in
+    wannolot-*|tytus-*) POD_NUM="${POD_ID##*-}";;
+    *) POD_NUM="$POD_ID";;
+esac
+POD_LABEL="wannolot-${POD_NUM}"
+CONTAINER="tytus-${POD_NUM}"
+
+run_droplet() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf 'DRY: ssh %s %s\n' "$DROPLET" "$*" >&2; return 0
+    fi
+    ssh -o BatchMode=yes "$DROPLET" "$@"
+}
+run_garage() {
+    run_droplet "WPID=\$(docker inspect -f '{{.State.Pid}}' ${WANNOLOT_NETNS}) && \
+                 nsenter -t \$WPID -n -- /root/.local/bin/garage -c ${DROPLET_CONFIG} $*"
+}
+run_pod() {
+    local cmd="$*"
+    cmd="${cmd//\'/\'\\\'\'}"
+    run_droplet "docker exec ${CONTAINER} sh -c '${cmd}'"
+}
+
+# ── 1. read existing credentials.json from pod ─────────────────────
+note "phase 1/3 — read existing credentials"
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    note "  dry: skipping pod read"
+    exit 0
+fi
+existing=$(run_pod "cat /app/workspace/.garagetytus/credentials.json 2>/dev/null || echo '{}'")
+if [[ "$existing" == "{}" ]]; then
+    note "  pod ${CONTAINER} not provisioned (no credentials.json) — nothing to refresh"
+    exit 0
+fi
+schema_v=$(printf '%s' "$existing" | jq -r '.schema_version // 0')
+[[ "$schema_v" == "1" ]] || err "unsupported schema_version=${schema_v}"
+
+mapfile -t buckets < <(printf '%s' "$existing" | jq -r '.buckets[].name')
+note "  found ${#buckets[@]} bucket(s): ${buckets[*]}"
+
+# ── 2. mint fresh per-bucket keys ──────────────────────────────────
+note "phase 2/3 — rotate per-bucket keys"
+declare -a fresh_blobs=()
+for bucket in "${buckets[@]}"; do
+    key_name="pod-${POD_NUM}-${bucket}"
+    # Delete the existing key (if any), then create + allow fresh
+    existing_id=$(run_garage "key list" 2>/dev/null \
+        | awk -v n="$key_name" '$3==n {print $1; exit}')
+    if [[ -n "$existing_id" ]]; then
+        run_garage "key delete --yes ${existing_id}" >/dev/null
+    fi
+    create_out=$(run_garage "key create ${key_name}")
+    ak=$(printf '%s\n' "$create_out" | awk -F': *' '/^Key ID/{print $2; exit}')
+    sk=$(printf '%s\n' "$create_out" | awk -F': *' '/^Secret key/{print $2; exit}')
+    [[ -n "$ak" && -n "$sk" ]] || err "failed to parse key from create output"
+    run_garage "bucket allow --read --write ${bucket} --key ${ak}" >/dev/null
+
+    # Preserve purpose + default flag from original
+    purpose=$(printf '%s' "$existing" \
+        | jq -r --arg b "$bucket" '.buckets[] | select(.name==$b) | .purpose // ""')
+    is_default=$(printf '%s' "$existing" \
+        | jq -r --arg b "$bucket" '.buckets[] | select(.name==$b) | .default // false')
+
+    fresh_blobs+=("$(jq -nc \
+        --arg name "$bucket" \
+        --arg endpoint "$INTERNAL_ENDPOINT" \
+        --arg ak "$ak" --arg sk "$sk" \
+        --arg gid "g_${POD_NUM}_${bucket}_$(date -u +%s)" \
+        --arg exp "$(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg purpose "$purpose" \
+        --argjson default "$is_default" \
+        '{name:$name, endpoint:$endpoint, region:"garage",
+          access_key:$ak, secret_key:$sk, perms:"rw",
+          grant_id:$gid, expires_at:$exp,
+          purpose:$purpose, default:$default}')")
+    note "  rotated ${key_name} (new id=${ak})"
+done
+
+now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+next_refresh=$(date -u -v+23d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d '+23 days' +%Y-%m-%dT%H:%M:%SZ)
+
+new_creds=$(printf '%s\n' "${fresh_blobs[@]}" \
+    | jq -s --arg now "$now_iso" \
+        --arg by "tytus-cli/${TYTUS_CLI_VERSION}-refresh ($(whoami)@$(hostname -s))" \
+        --arg pod "$POD_LABEL" \
+        '{schema_version:1, provisioned_at:$now, provisioned_by:$by,
+          pod_id:$pod, buckets:.}')
+
+new_audit=$(jq -n \
+    --arg now "$now_iso" \
+    --arg host "$(hostname -s)" \
+    --arg user "$(whoami)" \
+    --arg ver "${TYTUS_CLI_VERSION}-refresh" \
+    --arg drop "$DROPLET" \
+    --argjson n "${#buckets[@]}" \
+    --arg next "$next_refresh" \
+    '{provisioned_at:$now, provisioned_by_host:$host,
+      provisioned_by_user:$user, tytus_cli_version:$ver,
+      garagetytus_droplet:$drop, buckets_count:$n,
+      next_refresh_due:$next}')
+
+# ── 3. write rotated credentials + audit into pod ──────────────────
+note "phase 3/3 — write rotated credentials + audit into pod"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+printf '%s' "$new_creds" > "$TMP/credentials.json"
+printf '%s' "$new_audit" > "$TMP/_last-provision.json"
+scp -q "$TMP/credentials.json" "$TMP/_last-provision.json" "$DROPLET":/tmp/
+run_droplet "docker cp /tmp/credentials.json ${CONTAINER}:/app/workspace/.garagetytus/credentials.json && \
+             docker cp /tmp/_last-provision.json ${CONTAINER}:/app/workspace/.garagetytus/_last-provision.json"
+run_pod "chmod 600 /app/workspace/.garagetytus/credentials.json && chmod 644 /app/workspace/.garagetytus/_last-provision.json"
+run_droplet "rm -f /tmp/credentials.json /tmp/_last-provision.json"
+
+note "✅ refreshed ${POD_LABEL} — ${#buckets[@]} bucket(s) rotated, next refresh due ${next_refresh}"
