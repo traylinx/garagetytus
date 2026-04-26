@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""garagetytus-shared — shared-bucket helper for tytus pod agents.
+
+The agent calls this instead of typing access keys. Credentials live at
+/app/workspace/.garagetytus/credentials.json (provisioned by Mac-side
+`tytus connect`). Wrapper picks the right bucket per --bucket flag, or
+the default-marked bucket if omitted.
+
+Subcommands:
+    list [--bucket NAME] [--prefix PREFIX]
+    put  <local-file> [--bucket NAME] [--key KEY]
+    get  <key> <local-path> [--bucket NAME]
+    rm   <key> [--bucket NAME] [--yes]
+    buckets
+    whoami
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError, EndpointConnectionError
+
+DEFAULT_CREDS = "/app/workspace/.garagetytus/credentials.json"
+DEFAULT_PROVISION = "/app/workspace/.garagetytus/_last-provision.json"
+
+
+def load_creds():
+    path = os.environ.get("GARAGETYTUS_CREDENTIALS_PATH", DEFAULT_CREDS)
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        sys.exit(f"garagetytus-shared: not provisioned ({path} missing). "
+                 "Ask Sebastian to run `tytus connect --pod NN`.")
+    except json.JSONDecodeError as e:
+        sys.exit(f"garagetytus-shared: corrupt credentials file: {e}")
+    if data.get("schema_version") != 1:
+        sys.exit(f"garagetytus-shared: unsupported credentials schema_version "
+                 f"{data.get('schema_version')!r}")
+    if not data.get("buckets"):
+        sys.exit("garagetytus-shared: no buckets granted to this pod")
+    return data
+
+
+def pick_bucket(creds, name=None):
+    buckets = creds["buckets"]
+    if name:
+        for b in buckets:
+            if b["name"] == name:
+                return b
+        granted = ", ".join(b["name"] for b in buckets)
+        sys.exit(f"garagetytus-shared: bucket {name!r} not granted "
+                 f"(granted: {granted})")
+    defaults = [b for b in buckets if b.get("default")]
+    if defaults:
+        return defaults[0]
+    if len(buckets) == 1:
+        return buckets[0]
+    granted = ", ".join(b["name"] for b in buckets)
+    sys.exit(f"garagetytus-shared: multiple buckets granted ({granted}); "
+             f"pass --bucket NAME")
+
+
+def s3_client(b):
+    return boto3.client(
+        "s3",
+        endpoint_url=b["endpoint"],
+        aws_access_key_id=b["access_key"],
+        aws_secret_access_key=b["secret_key"],
+        region_name=b.get("region", "garage"),
+        config=Config(s3={"addressing_style": "path"},
+                      retries={"max_attempts": 3, "mode": "standard"}),
+    )
+
+
+def auto_key(creds, local_file):
+    pod_id = creds.get("pod_id", "unknown-pod")
+    return f"from-{pod_id}/{Path(local_file).name}"
+
+
+def cmd_list(args, creds):
+    b = pick_bucket(creds, args.bucket)
+    s3 = s3_client(b)
+    kwargs = {"Bucket": b["name"]}
+    if args.prefix:
+        kwargs["Prefix"] = args.prefix
+    try:
+        resp = s3.list_objects_v2(**kwargs)
+    except (ClientError, EndpointConnectionError) as e:
+        sys.exit(f"garagetytus-shared: list failed: {e}")
+    for obj in resp.get("Contents", []):
+        size = obj["Size"]
+        ts = obj["LastModified"].strftime("%Y-%m-%d %H:%M")
+        print(f"{size:>10}  {ts}  {obj['Key']}")
+
+
+def cmd_put(args, creds):
+    b = pick_bucket(creds, args.bucket)
+    if not os.path.isfile(args.local_file):
+        sys.exit(f"garagetytus-shared: no such file: {args.local_file}")
+    key = args.key or auto_key(creds, args.local_file)
+    s3 = s3_client(b)
+    try:
+        s3.upload_file(args.local_file, b["name"], key)
+    except (ClientError, EndpointConnectionError) as e:
+        sys.exit(f"garagetytus-shared: put failed: {e}")
+    print(f"put s3://{b['name']}/{key}")
+
+
+def cmd_get(args, creds):
+    b = pick_bucket(creds, args.bucket)
+    target = args.local_path
+    if os.path.isdir(target):
+        target = os.path.join(target, Path(args.key).name)
+    s3 = s3_client(b)
+    try:
+        s3.download_file(b["name"], args.key, target)
+    except (ClientError, EndpointConnectionError) as e:
+        sys.exit(f"garagetytus-shared: get failed: {e}")
+    print(f"got s3://{b['name']}/{args.key} -> {target}")
+
+
+def cmd_rm(args, creds):
+    b = pick_bucket(creds, args.bucket)
+    if not args.yes:
+        sys.exit(f"garagetytus-shared: refusing to delete s3://{b['name']}/"
+                 f"{args.key} without --yes")
+    s3 = s3_client(b)
+    try:
+        s3.delete_object(Bucket=b["name"], Key=args.key)
+    except (ClientError, EndpointConnectionError) as e:
+        sys.exit(f"garagetytus-shared: rm failed: {e}")
+    print(f"rm s3://{b['name']}/{args.key}")
+
+
+def cmd_buckets(_args, creds):
+    for b in creds["buckets"]:
+        marker = " (default)" if b.get("default") else ""
+        purpose = b.get("purpose", "")
+        perms = b.get("perms", "rw")
+        print(f"{b['name']:<24}  {perms:<3}  {purpose}{marker}")
+
+
+def cmd_whoami(_args, creds):
+    print(f"pod_id:           {creds.get('pod_id', '?')}")
+    print(f"provisioned_at:   {creds.get('provisioned_at', '?')}")
+    print(f"provisioned_by:   {creds.get('provisioned_by', '?')}")
+    print(f"buckets_granted:  {len(creds['buckets'])}")
+    try:
+        with open(DEFAULT_PROVISION) as fh:
+            audit = json.load(fh)
+        print(f"next_refresh_due: {audit.get('next_refresh_due', '?')}")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="garagetytus-shared",
+        description="Shared-bucket helper for tytus pod agents.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pl = sub.add_parser("list", help="list bucket contents")
+    pl.add_argument("--bucket")
+    pl.add_argument("--prefix")
+    pl.set_defaults(func=cmd_list)
+
+    pp = sub.add_parser("put", help="upload a local file")
+    pp.add_argument("local_file")
+    pp.add_argument("--bucket")
+    pp.add_argument("--key", help="explicit key (default: from-<pod-id>/<basename>)")
+    pp.set_defaults(func=cmd_put)
+
+    pg = sub.add_parser("get", help="download an object")
+    pg.add_argument("key")
+    pg.add_argument("local_path")
+    pg.add_argument("--bucket")
+    pg.set_defaults(func=cmd_get)
+
+    pr = sub.add_parser("rm", help="delete an object (requires --yes)")
+    pr.add_argument("key")
+    pr.add_argument("--bucket")
+    pr.add_argument("--yes", action="store_true")
+    pr.set_defaults(func=cmd_rm)
+
+    sub.add_parser("buckets", help="list buckets granted to this pod"
+                   ).set_defaults(func=cmd_buckets)
+    sub.add_parser("whoami", help="show pod identity + provisioning audit"
+                   ).set_defaults(func=cmd_whoami)
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    creds = load_creds()
+    args.func(args, creds)
+
+
+if __name__ == "__main__":
+    main()
