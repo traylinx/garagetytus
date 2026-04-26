@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# garagetytus-folder-bind — one-Mac-command setup for shared folders.
+#
+# Per Q14 verdict: launchd polling-only, NO WatchPaths, timeout-wrapped
+# rclone bisync. The brittle WatchPaths plist that v0.5.0 attempted is
+# explicitly NOT what this ships.
+#
+# Usage:
+#   garagetytus folder bind <local-path> <bucket> [--to <pod>...]
+#                           [--auto-sync] [--interval N] [--timeout N]
+#                           [--rclone-conf PATH] [--droplet HOST]
+#                           [--no-pod-restart] [--dry-run]
+#
+# Example (the headline UX):
+#   garagetytus folder bind ~/Documents/work testbucket --to 02 --auto-sync
+#
+#   creates testbucket if absent, mints a Mac-side `mac-<bucket>` Garage
+#   key, adds an rclone remote, runs initial bisync --resync, drops a
+#   60-second-poll launchd plist, AND provisions tytus-02 with the
+#   garagetytus-shared wrapper for the same bucket. One command, full UX.
+
+set -euo pipefail
+
+DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+DROPLET_CONFIG="/var/lib/garagetytus/config/garagetytus.toml"
+WANNOLOT_NETNS="wannolot-01"
+EXTERNAL_ENDPOINT="http://10.42.42.1:3900"
+RCLONE_REMOTE="garagetytus"
+RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROVISION_SCRIPT="${SCRIPT_DIR}/garagetytus-pod-provision"
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+WORKDIR_BASE="${HOME}/.cache/garagetytus/bisync"
+LOG_BASE="/tmp/garagetytus-bisync"
+
+LOCAL_PATH=""
+BUCKET=""
+PODS=()
+AUTO_SYNC=0
+INTERVAL=60
+TIMEOUT_SEC=45
+NO_POD_RESTART=0
+DRY_RUN=0
+
+err() { printf 'folder-bind: %s\n' "$*" >&2; exit 1; }
+note() { printf 'folder-bind: %s\n' "$*" >&2; }
+usage() { sed -n '1,21p' "$0" | sed 's|^# \{0,1\}||'; }
+
+# Parse `bind` as the first positional if invoked via the
+# `garagetytus folder bind` form (Phase D shape).
+if [[ "${1:-}" == "folder" && "${2:-}" == "bind" ]]; then shift 2; fi
+if [[ "${1:-}" == "bind" ]]; then shift; fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --to)               PODS+=("$2"); shift 2;;
+        --auto-sync)        AUTO_SYNC=1; shift;;
+        --interval)         INTERVAL="$2"; shift 2;;
+        --timeout)          TIMEOUT_SEC="$2"; shift 2;;
+        --rclone-conf)      RCLONE_CONF="$2"; shift 2;;
+        --droplet)          DROPLET="$2"; shift 2;;
+        --no-pod-restart)   NO_POD_RESTART=1; shift;;
+        --dry-run)          DRY_RUN=1; shift;;
+        -h|--help)          usage; exit 0;;
+        --) shift; break;;
+        -*) err "unknown flag: $1 (try --help)";;
+        *)
+            if   [[ -z "$LOCAL_PATH" ]]; then LOCAL_PATH="$1"
+            elif [[ -z "$BUCKET" ]];     then BUCKET="$1"
+            else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+[[ -n "$LOCAL_PATH" ]] || err "missing <local-path> (try --help)"
+[[ -n "$BUCKET" ]]     || err "missing <bucket> (try --help)"
+
+# Validate bucket name shape (Garage rules: 3-63, lowercase alnum/dot/hyphen,
+# alnum endpoints).
+if ! [[ "$BUCKET" =~ ^[a-z0-9]([a-z0-9.-]{1,61}[a-z0-9])?$ ]]; then
+    err "bucket name '${BUCKET}' violates Garage naming rules"
+fi
+
+# Resolve LOCAL_PATH to absolute path
+case "$LOCAL_PATH" in
+    /*) ;;
+    ~*) LOCAL_PATH="${LOCAL_PATH/#\~/$HOME}";;
+    *)  LOCAL_PATH="$(pwd)/${LOCAL_PATH}";;
+esac
+
+SAFE_NAME=$(printf '%s' "$BUCKET-$(basename "$LOCAL_PATH")" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9.-]/-/g')
+
+PLIST_LABEL="com.traylinx.garagetytus.bisync.${SAFE_NAME}"
+PLIST_PATH="${PLIST_DIR}/${PLIST_LABEL}.plist"
+WORKDIR="${WORKDIR_BASE}/${SAFE_NAME}"
+LOG_OUT="${LOG_BASE}-${SAFE_NAME}.log"
+LOG_ERR="${LOG_BASE}-${SAFE_NAME}.err"
+
+note "target local=${LOCAL_PATH} bucket=${BUCKET}"
+[[ "${#PODS[@]}" -gt 0 ]] && note "target pods=${PODS[*]}"
+[[ "$AUTO_SYNC" -eq 1 ]] && note "auto-sync ON (interval=${INTERVAL}s, timeout=${TIMEOUT_SEC}s)"
+[[ "$DRY_RUN"   -eq 1 ]] && note "DRY-RUN — no remote/local changes"
+
+run_droplet() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf 'DRY: ssh %s %s\n' "$DROPLET" "$*" >&2; return 0
+    fi
+    ssh -o BatchMode=yes "$DROPLET" "$@"
+}
+run_garage() {
+    run_droplet "WPID=\$(docker inspect -f '{{.State.Pid}}' ${WANNOLOT_NETNS}) && \
+                 nsenter -t \$WPID -n -- /root/.local/bin/garage -c ${DROPLET_CONFIG} $*"
+}
+
+# ── 1. ensure bucket exists on droplet ─────────────────────────────
+note "phase 1/6 — ensure bucket exists"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    if run_garage "bucket info ${BUCKET}" >/dev/null 2>&1; then
+        note "  bucket ${BUCKET} already exists"
+    else
+        run_garage "bucket create ${BUCKET}" >/dev/null
+        note "  bucket ${BUCKET} created"
+    fi
+fi
+
+# ── 2-3. ensure Mac-side key + rclone remote can reach this bucket ─
+note "phase 2/6 — ensure Mac key + rclone remote can reach ${BUCKET}"
+existing_ak=""
+if [[ -f "$RCLONE_CONF" ]]; then
+    # Extract access_key_id from existing [garagetytus] remote (if present).
+    existing_ak=$(awk -v r="[${RCLONE_REMOTE}]" '
+        $0 == r { in_block=1; next }
+        /^\[/   { in_block=0 }
+        in_block && /^access_key_id/ {
+            sub(/^access_key_id[[:space:]]*=[[:space:]]*/, "")
+            print; exit
+        }' "$RCLONE_CONF")
+fi
+
+if [[ -n "$existing_ak" ]]; then
+    # Reuse the existing remote's key: just add bucket allow on the droplet.
+    note "  reusing existing rclone remote key id=${existing_ak}"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        run_garage "bucket allow --read --write ${BUCKET} --key ${existing_ak}" >/dev/null
+    fi
+else
+    # No existing remote — mint a fresh `mac-shared` key with rw on this
+    # bucket and write a new rclone remote section. Future bind calls
+    # detect this key and just add more bucket allows to it.
+    mac_key_name="mac-shared"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        ak="GKDRYRUNMAC"; sk="DRYRUN"
+    else
+        # If the key already exists from a previous bind: rotate (delete +
+        # recreate) so we know the secret_key for the rclone remote write.
+        prev_id=$(run_garage "key list" 2>/dev/null \
+            | awk -v n="$mac_key_name" '$3==n {print $1; exit}')
+        [[ -n "$prev_id" ]] && run_garage "key delete --yes ${prev_id}" >/dev/null
+        create_out=$(run_garage "key create ${mac_key_name}")
+        ak=$(printf '%s\n' "$create_out" | awk -F': *' '/^Key ID/{print $2; exit}')
+        sk=$(printf '%s\n' "$create_out" | awk -F': *' '/^Secret key/{print $2; exit}')
+        [[ -n "$ak" && -n "$sk" ]] || err "failed to parse key from create output"
+        run_garage "bucket allow --read --write ${BUCKET} --key ${ak}" >/dev/null
+    fi
+    note "  minted ${mac_key_name} (id=${ak}); writing rclone remote"
+
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$(dirname "$RCLONE_CONF")"
+        if [[ -f "$RCLONE_CONF" ]]; then
+            cp "$RCLONE_CONF" "${RCLONE_CONF}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+            cat "$RCLONE_CONF" > "${RCLONE_CONF}.new"
+            printf '\n' >> "${RCLONE_CONF}.new"
+        else
+            : > "${RCLONE_CONF}.new"
+        fi
+        cat >> "${RCLONE_CONF}.new" <<RCEOF
+[${RCLONE_REMOTE}]
+type = s3
+provider = Other
+access_key_id = ${ak}
+secret_access_key = ${sk}
+endpoint = ${EXTERNAL_ENDPOINT}
+region = garage
+RCEOF
+        mv "${RCLONE_CONF}.new" "$RCLONE_CONF"
+        chmod 600 "$RCLONE_CONF"
+    fi
+fi
+
+note "phase 3/6 — bucket-allow confirmed for ${BUCKET}"
+
+# ── 4. mkdir local path + initial bisync --resync ─────────────────
+note "phase 4/6 — mkdir + initial bisync --resync"
+mkdir -p "$LOCAL_PATH" "$WORKDIR"
+# rclone bisync's safety check refuses to sync if the prior path1
+# listing is empty ("Empty prior Path1 listing"). An empty initial
+# --resync poisons subsequent runs. Drop a sentinel file BEFORE the
+# initial sync so path1.lst always has at least one entry.
+MARKER_FILE="${LOCAL_PATH}/.garagetytus-bound"
+if [[ ! -f "$MARKER_FILE" ]]; then
+    cat > "$MARKER_FILE" <<MEOF
+This folder is bound to s3://${BUCKET} via garagetytus.
+Bound at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+Bound by: $(whoami)@$(hostname -s)
+Do not delete this marker — bisync uses it to track folder identity.
+MEOF
+fi
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    rclone --config "$RCLONE_CONF" \
+        bisync "$LOCAL_PATH" "${RCLONE_REMOTE}:${BUCKET}" \
+        --workdir "$WORKDIR" \
+        --create-empty-src-dirs \
+        --resync \
+        --max-lock 2m 2>&1 | sed 's/^/    /' || \
+        err "initial bisync --resync failed"
+    note "  initial sync complete: ${LOCAL_PATH} ↔ ${RCLONE_REMOTE}:${BUCKET}"
+fi
+
+# ── 5. (optional) launchd plist for polling auto-sync ─────────────
+if [[ "$AUTO_SYNC" -eq 1 ]]; then
+    note "phase 5/6 — install launchd plist (StartInterval=${INTERVAL}, timeout=${TIMEOUT_SEC})"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$PLIST_DIR"
+        # Per Q14 Option 1: NO WatchPaths, NO KeepAlive. Just polling
+        # interval + bounded timeout per run.
+        cat > "$PLIST_PATH" <<PLEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>bash</string>
+    <string>-c</string>
+    <string>/usr/local/bin/timeout ${TIMEOUT_SEC} /usr/local/bin/rclone --config "${RCLONE_CONF}" bisync "${LOCAL_PATH}" "${RCLONE_REMOTE}:${BUCKET}" --workdir "${WORKDIR}" --max-lock 2m --create-empty-src-dirs --conflict-resolve newer --resilient</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>${INTERVAL}</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${LOG_OUT}</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_ERR}</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+PLEOF
+        # Reload to pick up changes if already loaded
+        launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        launchctl load "$PLIST_PATH"
+        note "  launchd job ${PLIST_LABEL} loaded"
+    fi
+else
+    note "phase 5/6 — skipped (no --auto-sync; one-shot bisync only)"
+fi
+
+# ── 6. (optional) provision named pods ─────────────────────────────
+if [[ "${#PODS[@]}" -gt 0 ]]; then
+    note "phase 6/6 — provision pods: ${PODS[*]}"
+    [[ -x "$PROVISION_SCRIPT" ]] || err "missing ${PROVISION_SCRIPT}"
+    for pod in "${PODS[@]}"; do
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            note "  DRY: would call ${PROVISION_SCRIPT} ${pod} --bucket ${BUCKET}"
+        else
+            extra=()
+            [[ "$NO_POD_RESTART" -eq 1 ]] && extra+=(--no-restart)
+            "$PROVISION_SCRIPT" "$pod" --bucket "$BUCKET" --droplet "$DROPLET" "${extra[@]}" \
+                || err "pod-provision failed for pod ${pod}"
+        fi
+    done
+else
+    note "phase 6/6 — skipped (no --to pods)"
+fi
+
+note "✅ folder-bind complete: ${LOCAL_PATH} ↔ ${RCLONE_REMOTE}:${BUCKET}"
