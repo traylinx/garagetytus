@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# garagetytus-pod-provision — wire one tytus pod to one or more shared
+# buckets so its agent can call `garagetytus-shared` without ever seeing
+# raw access keys.
+#
+# Provisioned per Q11 verdict: per-bucket grants. Each bucket gets its
+# own dedicated `pod-<pod-id>-<bucket>` Garage access key with RW on
+# that bucket only — revoking a single bucket grant doesn't touch the
+# others.
+#
+# Provisioned per Q12 verdict: appends to the pod's
+# `agents.defaults.systemPromptOverride` via deep-merge in
+# `config.user.json`, with an idempotent marker so re-running the
+# script REPLACES the old fragment rather than stacking them.
+#
+# Per Q13: `garagetytus-pod-deprovision` (sibling script) does the
+# reverse; this script never deletes existing grants without --replace.
+#
+# Usage:
+#   garagetytus-pod-provision <pod-id> --bucket NAME [--bucket NAME2 ...]
+#                             [--droplet HOST] [--droplet-config PATH]
+#                             [--no-restart] [--dry-run]
+#
+# Example:
+#   garagetytus-pod-provision 02 --bucket testbucket
+#
+# Notes:
+#   - <pod-id> is the numeric slot ("02"), matching `tytus connect --pod 02`.
+#   - The pod_label written into credentials.json is `wannolot-<pod-id>`.
+#   - Re-running is idempotent: existing per-bucket keys are reused.
+
+set -euo pipefail
+
+DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+DROPLET_CONFIG="/var/lib/garagetytus/config/garagetytus.toml"
+WANNOLOT_NETNS="wannolot-01"
+INTERNAL_ENDPOINT="http://10.42.42.1:3900"
+
+WRAPPER_LOCAL="$(cd "$(dirname "$0")" && pwd)/garagetytus-shared"
+MARKER="<!-- garagetytus:shared-folders v1 -->"
+TYTUS_CLI_VERSION="v0.5.1"
+
+POD_ID=""
+BUCKETS=()
+NO_RESTART=0
+DRY_RUN=0
+
+err()  { printf 'pod-provision: %s\n' "$*" >&2; exit 1; }
+note() { printf 'pod-provision: %s\n' "$*" >&2; }
+usage() { sed -n '1,30p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bucket)         BUCKETS+=("$2"); shift 2;;
+        --droplet)        DROPLET="$2"; shift 2;;
+        --droplet-config) DROPLET_CONFIG="$2"; shift 2;;
+        --no-restart)     NO_RESTART=1; shift;;
+        --dry-run)        DRY_RUN=1; shift;;
+        -h|--help)        usage; exit 0;;
+        --) shift; break;;
+        -*) err "unknown flag: $1 (try --help)";;
+        *)
+            if [[ -z "$POD_ID" ]]; then POD_ID="$1"
+            else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+[[ -n "$POD_ID" ]] || err "missing <pod-id> (try --help)"
+[[ "${#BUCKETS[@]}" -gt 0 ]] || err "need at least one --bucket NAME"
+[[ -f "$WRAPPER_LOCAL" ]] || err "wrapper not found at $WRAPPER_LOCAL"
+
+# Normalize pod-id: accept "02", "wannolot-02", or "tytus-02".
+case "$POD_ID" in
+    wannolot-*|tytus-*) POD_NUM="${POD_ID##*-}";;
+    *) POD_NUM="$POD_ID";;
+esac
+POD_LABEL="wannolot-${POD_NUM}"
+CONTAINER="tytus-${POD_NUM}"
+
+note "target pod=${CONTAINER} label=${POD_LABEL} buckets=${BUCKETS[*]}"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    note "dry-run — no droplet/pod changes will be made"
+fi
+
+run_droplet() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf 'DRY: ssh %s %s\n' "$DROPLET" "$*" >&2
+        return 0
+    fi
+    ssh -o BatchMode=yes "$DROPLET" "$@"
+}
+
+run_garage() {
+    # Wraps `garage <args>` inside the wannolot-01 netns + droplet config.
+    run_droplet "WPID=\$(docker inspect -f '{{.State.Pid}}' ${WANNOLOT_NETNS}) && \
+                 nsenter -t \$WPID -n -- /root/.local/bin/garage -c ${DROPLET_CONFIG} $*"
+}
+
+run_pod() {
+    # Run a command inside the tytus-NN container. Wraps in `sh -c '...'`
+    # so any `&&` / `;` chains in the caller execute INSIDE the container,
+    # not on the droplet host shell (which would silently mask failures
+    # on commands targeting pod-only paths).
+    local cmd="$*"
+    # Escape single quotes inside cmd: ' → '\''
+    cmd="${cmd//\'/\'\\\'\'}"
+    run_droplet "docker exec ${CONTAINER} sh -c '${cmd}'"
+}
+
+# ── 1. sanity-check droplet + pod liveness ────────────────────────
+note "phase 1/6 — sanity-check droplet + pod"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    state=$(run_droplet "docker inspect -f '{{.State.Status}}' ${CONTAINER}" 2>/dev/null || true)
+    [[ "$state" == "running" ]] || err "container ${CONTAINER} not running on ${DROPLET} (state=${state:-missing})"
+    run_garage status >/dev/null || err "garage daemon unreachable on ${DROPLET}"
+fi
+
+# ── 2. mint or reuse per-bucket grants ─────────────────────────────
+note "phase 2/6 — mint per-bucket grants"
+declare -a CRED_BLOBS=()
+for bucket in "${BUCKETS[@]}"; do
+    key_name="pod-${POD_NUM}-${bucket}"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        note "  dry: would mint ${key_name} on ${bucket}"
+        ak="GK00000000000000DRYRUNAK"; sk="0000000000000000000000000000000000000000000000000000000000000000DRY"
+    else
+        # Garage v2.3 prints "Key ID:" / "Secret key:" only on creation.
+        # If the key already exists, `key info` returns the existing one
+        # but redacts the secret. So: try to reuse an existing key by
+        # name (preferred — keeps long-lived grants stable), else create.
+        existing_id=$(run_garage "key list" 2>/dev/null \
+            | awk -v n="$key_name" '$3==n {print $1; exit}')
+        if [[ -n "$existing_id" ]]; then
+            note "  reusing existing key ${key_name} (id=${existing_id})"
+            # Garage redacts secret on `key info`. We need the secret to
+            # populate credentials.json. Rotate: delete + recreate.
+            run_garage "key delete --yes ${existing_id}" >/dev/null
+            existing_id=""
+        fi
+        create_out=$(run_garage "key create ${key_name}")
+        ak=$(printf '%s\n' "$create_out" | awk -F': *' '/^Key ID/{print $2; exit}')
+        sk=$(printf '%s\n' "$create_out" | awk -F': *' '/^Secret key/{print $2; exit}')
+        [[ -n "$ak" && -n "$sk" ]] || err "failed to parse key from create output"
+        run_garage "bucket allow --read --write ${bucket} --key ${ak}" >/dev/null
+        note "  minted ${key_name} (id=${ak}) on bucket ${bucket}"
+    fi
+    CRED_BLOBS+=("$(jq -nc \
+        --arg name "$bucket" \
+        --arg endpoint "$INTERNAL_ENDPOINT" \
+        --arg ak "$ak" --arg sk "$sk" \
+        --arg gid "g_${POD_NUM}_${bucket}_$(date -u +%s)" \
+        --arg exp "$(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)" \
+        '{name:$name, endpoint:$endpoint, region:"garage",
+          access_key:$ak, secret_key:$sk, perms:"rw",
+          grant_id:$gid, expires_at:$exp,
+          purpose:"general work files", default:false}')")
+done
+
+# Mark first bucket as default
+buckets_json=$(printf '%s\n' "${CRED_BLOBS[@]}" \
+    | jq -s '[ .[0] + {default:true} ] + .[1:]')
+
+now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+next_refresh=$(date -u -v+23d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d '+23 days' +%Y-%m-%dT%H:%M:%SZ)
+
+creds_json=$(jq -n \
+    --arg now "$now_iso" \
+    --arg by "tytus-cli/${TYTUS_CLI_VERSION} ($(whoami)@$(hostname -s))" \
+    --arg pod "$POD_LABEL" \
+    --argjson buckets "$buckets_json" \
+    '{schema_version:1, provisioned_at:$now, provisioned_by:$by,
+      pod_id:$pod, buckets:$buckets}')
+
+audit_json=$(jq -n \
+    --arg now "$now_iso" \
+    --arg host "$(hostname -s)" \
+    --arg user "$(whoami)" \
+    --arg ver "$TYTUS_CLI_VERSION" \
+    --arg drop "$DROPLET" \
+    --argjson n "${#BUCKETS[@]}" \
+    --arg next "$next_refresh" \
+    '{provisioned_at:$now, provisioned_by_host:$host,
+      provisioned_by_user:$user, tytus_cli_version:$ver,
+      garagetytus_droplet:$drop, buckets_count:$n,
+      next_refresh_due:$next}')
+
+# ── 3. SCP wrapper + creds → droplet → docker cp into pod ───────
+note "phase 3/6 — push wrapper + credentials into pod"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+printf '%s' "$creds_json" > "$TMP/credentials.json"
+printf '%s' "$audit_json" > "$TMP/_last-provision.json"
+cp "$WRAPPER_LOCAL" "$TMP/garagetytus-shared"
+chmod 755 "$TMP/garagetytus-shared"
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    scp -q "$TMP/credentials.json" "$TMP/_last-provision.json" \
+        "$TMP/garagetytus-shared" "$DROPLET":/tmp/
+    run_pod "mkdir -p /app/workspace/.garagetytus"
+    run_droplet "docker cp /tmp/garagetytus-shared ${CONTAINER}:/app/workspace/.garagetytus/garagetytus-shared && \
+                 docker cp /tmp/credentials.json ${CONTAINER}:/app/workspace/.garagetytus/credentials.json && \
+                 docker cp /tmp/_last-provision.json ${CONTAINER}:/app/workspace/.garagetytus/_last-provision.json"
+    run_pod "chmod 755 /app/workspace/.garagetytus/garagetytus-shared && \
+             chmod 600 /app/workspace/.garagetytus/credentials.json && \
+             chmod 644 /app/workspace/.garagetytus/_last-provision.json"
+    run_droplet "rm -f /tmp/credentials.json /tmp/_last-provision.json /tmp/garagetytus-shared"
+fi
+
+# ── 4. build the systemPromptOverride append ──────────────────────
+note "phase 4/6 — append shared-folder fragment to systemPromptOverride"
+buckets_md=$(printf '%s\n' "${CRED_BLOBS[@]}" \
+    | jq -r '. | "  - \(.name) (rw): \(.purpose)"')
+
+fragment=$(cat <<EOF
+
+${MARKER}
+## Shared folders
+
+You can share files with Sebastian and other pods through shared S3
+buckets. Use the helper command — credentials are managed for you, do
+NOT type access keys yourself:
+
+  garagetytus-shared list [--bucket NAME]
+  garagetytus-shared put <local-file> [--bucket NAME] [--key KEY]
+  garagetytus-shared get <key> <local-path> [--bucket NAME]
+
+Your pod identity (used in file prefixes): ${POD_LABEL}
+
+Available buckets:
+${buckets_md}
+
+NAMING CONVENTION inside any bucket:
+  - Files YOU produce: prefix the key with from-${POD_LABEL}/
+  - Files Sebastian sent you: look in from-mac/
+  - Broadcast to all pods: prefix with broadcast/
+
+DON'T PUT in shared buckets: secrets, multi-GB blobs without explicit
+user approval, agent memory (use Brain instead).
+
+If \`garagetytus-shared\` returns "endpoint unreachable" or
+"credentials expired", tell Sebastian — don't loop on retries.
+EOF
+)
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    # Read base prompt + current overlay from pod
+    base_prompt=$(run_pod "jq -r '.agents.defaults.systemPromptOverride // \"\"' /app/workspace/.openclaw/config.json")
+    current_overlay=$(run_pod "cat /app/workspace/.openclaw/config.user.json 2>/dev/null || echo '{}'")
+    overlay_prompt=$(printf '%s' "$current_overlay" \
+        | jq -r '.agents.defaults.systemPromptOverride // ""')
+
+    # If overlay already has our marker, strip from marker → EOF and rebuild.
+    # Otherwise: start from base_prompt, append our fragment.
+    if [[ "$overlay_prompt" == *"$MARKER"* ]]; then
+        # Take everything before the marker; will re-append fresh fragment.
+        cleaned=$(printf '%s' "$overlay_prompt" \
+            | awk -v m="$MARKER" 'BEGIN{p=1} index($0,m){p=0} p{print}')
+        new_prompt="${cleaned}${fragment}"
+    elif [[ -n "$overlay_prompt" ]]; then
+        new_prompt="${overlay_prompt}${fragment}"
+    else
+        new_prompt="${base_prompt}${fragment}"
+    fi
+
+    new_overlay=$(printf '%s' "$current_overlay" \
+        | jq --arg sp "$new_prompt" \
+            '.agents = (.agents // {}) | .agents.defaults = (.agents.defaults // {}) | .agents.defaults.systemPromptOverride = $sp')
+
+    printf '%s' "$new_overlay" > "$TMP/config.user.json"
+    scp -q "$TMP/config.user.json" "$DROPLET":/tmp/config.user.json
+    # Backup pod's existing overlay before overwrite
+    run_pod "cp /app/workspace/.openclaw/config.user.json /app/workspace/.openclaw/config.user.json.bak.\$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true"
+    run_droplet "docker cp /tmp/config.user.json ${CONTAINER}:/app/workspace/.openclaw/config.user.json && \
+                 rm -f /tmp/config.user.json"
+fi
+
+# ── 5. restart pod so the overlay merges into the live config ─────
+note "phase 5/6 — restart ${CONTAINER} (skip with --no-restart)"
+if [[ "$NO_RESTART" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+    run_droplet "docker restart ${CONTAINER}" >/dev/null
+    # Brief wait so the container's healthcheck reports back
+    for _ in $(seq 1 20); do
+        s=$(run_droplet "docker inspect -f '{{.State.Health.Status}}' ${CONTAINER}" 2>/dev/null || echo unknown)
+        [[ "$s" == "healthy" ]] && break
+        sleep 1
+    done
+    note "  container health: ${s:-unknown}"
+fi
+
+# ── 6. smoke-test the wrapper ─────────────────────────────────────
+note "phase 6/6 — smoke-test garagetytus-shared"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    run_pod "python3 /app/workspace/.garagetytus/garagetytus-shared whoami" >&2
+    run_pod "python3 /app/workspace/.garagetytus/garagetytus-shared buckets" >&2
+fi
+
+note "✅ provisioned ${POD_LABEL} for buckets: ${BUCKETS[*]}"

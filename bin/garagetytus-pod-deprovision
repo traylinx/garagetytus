@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# garagetytus-pod-deprovision — undo what garagetytus-pod-provision did.
+#
+# Per Q13 verdict: revoke-on-disconnect.
+#  - Deletes per-bucket Garage keys (`pod-<pod-id>-<bucket>`)
+#  - Removes credentials.json + _last-provision.json from the pod
+#  - Strips the shared-folder fragment from config.user.json (split at marker)
+#  - Optionally restarts the pod so the overlay change takes effect
+#
+# Usage:
+#   garagetytus-pod-deprovision <pod-id> [--bucket NAME...] [--all-buckets]
+#                               [--droplet HOST] [--no-restart] [--dry-run]
+#
+# If --all-buckets: revoke every key whose name matches `pod-<pod-id>-*`.
+# Otherwise: only the specified --bucket grants are revoked.
+
+set -euo pipefail
+
+DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+DROPLET_CONFIG="/var/lib/garagetytus/config/garagetytus.toml"
+WANNOLOT_NETNS="wannolot-01"
+MARKER="<!-- garagetytus:shared-folders v1 -->"
+
+POD_ID=""
+BUCKETS=()
+ALL_BUCKETS=0
+NO_RESTART=0
+DRY_RUN=0
+
+err() { printf 'pod-deprovision: %s\n' "$*" >&2; exit 1; }
+note() { printf 'pod-deprovision: %s\n' "$*" >&2; }
+usage() { sed -n '1,18p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bucket)        BUCKETS+=("$2"); shift 2;;
+        --all-buckets)   ALL_BUCKETS=1; shift;;
+        --droplet)       DROPLET="$2"; shift 2;;
+        --no-restart)    NO_RESTART=1; shift;;
+        --dry-run)       DRY_RUN=1; shift;;
+        -h|--help)       usage; exit 0;;
+        --) shift; break;;
+        -*) err "unknown flag: $1 (try --help)";;
+        *)
+            if [[ -z "$POD_ID" ]]; then POD_ID="$1"
+            else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+[[ -n "$POD_ID" ]] || err "missing <pod-id> (try --help)"
+[[ "${#BUCKETS[@]}" -gt 0 || "$ALL_BUCKETS" -eq 1 ]] \
+    || err "need --bucket NAME (repeatable) or --all-buckets"
+
+case "$POD_ID" in
+    wannolot-*|tytus-*) POD_NUM="${POD_ID##*-}";;
+    *) POD_NUM="$POD_ID";;
+esac
+POD_LABEL="wannolot-${POD_NUM}"
+CONTAINER="tytus-${POD_NUM}"
+
+run_droplet() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf 'DRY: ssh %s %s\n' "$DROPLET" "$*" >&2; return 0
+    fi
+    ssh -o BatchMode=yes "$DROPLET" "$@"
+}
+run_garage() {
+    run_droplet "WPID=\$(docker inspect -f '{{.State.Pid}}' ${WANNOLOT_NETNS}) && \
+                 nsenter -t \$WPID -n -- /root/.local/bin/garage -c ${DROPLET_CONFIG} $*"
+}
+run_pod() {
+    # Wraps in `sh -c '...'` so chains run INSIDE the container.
+    local cmd="$*"
+    cmd="${cmd//\'/\'\\\'\'}"
+    run_droplet "docker exec ${CONTAINER} sh -c '${cmd}'"
+}
+
+# ── 1. resolve which bucket grants to revoke ───────────────────────
+note "phase 1/4 — resolve grants to revoke for ${POD_LABEL}"
+if [[ "$ALL_BUCKETS" -eq 1 ]]; then
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mapfile -t found < <(run_garage "key list" \
+            | awk -v prefix="pod-${POD_NUM}-" '$3 ~ "^"prefix {print $1" "$3}')
+    else
+        found=("DRY00 pod-${POD_NUM}-DRYALL")
+    fi
+else
+    found=()
+    for bucket in "${BUCKETS[@]}"; do
+        key_name="pod-${POD_NUM}-${bucket}"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            found+=("DRY00 ${key_name}")
+        else
+            id=$(run_garage "key list" 2>/dev/null \
+                | awk -v n="$key_name" '$3==n {print $1; exit}')
+            if [[ -n "$id" ]]; then
+                found+=("$id $key_name")
+            else
+                note "  no grant for ${key_name} — skipping"
+            fi
+        fi
+    done
+fi
+
+if [[ "${#found[@]}" -eq 0 ]]; then
+    note "no grants matched — nothing to revoke on droplet"
+fi
+
+# ── 2. revoke each Garage key ──────────────────────────────────────
+note "phase 2/4 — revoke Garage keys"
+for entry in "${found[@]}"; do
+    [[ -z "$entry" ]] && continue
+    id="${entry%% *}"
+    name="${entry##* }"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        note "  dry: would delete ${name} (id=${id})"
+    else
+        run_garage "key delete --yes ${id}" >/dev/null
+        note "  deleted ${name} (id=${id})"
+    fi
+done
+
+# ── 3. strip pod-side credentials + system-prompt fragment ────────
+note "phase 3/4 — strip credentials + prompt fragment from pod"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    state=$(run_droplet "docker inspect -f '{{.State.Status}}' ${CONTAINER}" 2>/dev/null || true)
+    if [[ "$state" != "running" ]]; then
+        note "  container ${CONTAINER} not running (state=${state:-missing}) — skipping pod-side cleanup"
+    else
+        # If specific buckets requested, strip just those entries from
+        # credentials.json. If --all-buckets or that leaves it empty,
+        # delete credentials.json entirely.
+        if [[ "$ALL_BUCKETS" -eq 1 ]]; then
+            run_pod "rm -f /app/workspace/.garagetytus/credentials.json /app/workspace/.garagetytus/_last-provision.json"
+            note "  removed credentials.json + _last-provision.json"
+        else
+            # Filter out revoked buckets, keep the rest
+            for bucket in "${BUCKETS[@]}"; do
+                run_pod "jq --arg b ${bucket} '.buckets |= map(select(.name != \$b))' /app/workspace/.garagetytus/credentials.json > /tmp/c.json && mv /tmp/c.json /app/workspace/.garagetytus/credentials.json"
+            done
+            remaining=$(run_pod "jq '.buckets | length' /app/workspace/.garagetytus/credentials.json" 2>/dev/null || echo 0)
+            if [[ "$remaining" -eq 0 ]]; then
+                run_pod "rm -f /app/workspace/.garagetytus/credentials.json /app/workspace/.garagetytus/_last-provision.json"
+                note "  no buckets left — removed credentials.json + _last-provision.json"
+            else
+                note "  credentials.json: ${remaining} bucket(s) remain"
+            fi
+        fi
+
+        # Strip our fragment from config.user.json's systemPromptOverride
+        # IFF this was a full deprovision (no buckets remain).
+        full_strip=0
+        if [[ "$ALL_BUCKETS" -eq 1 ]]; then
+            full_strip=1
+        elif ! run_pod "test -f /app/workspace/.garagetytus/credentials.json"; then
+            full_strip=1
+        fi
+        if [[ "$full_strip" -eq 1 ]]; then
+            current_overlay=$(run_pod "cat /app/workspace/.openclaw/config.user.json 2>/dev/null || echo '{}'")
+            overlay_prompt=$(printf '%s' "$current_overlay" \
+                | jq -r '.agents.defaults.systemPromptOverride // ""')
+            if [[ "$overlay_prompt" == *"$MARKER"* ]]; then
+                cleaned=$(printf '%s' "$overlay_prompt" \
+                    | awk -v m="$MARKER" 'BEGIN{p=1} index($0,m){p=0} p{print}' \
+                    | sed -e ':a' -e '/^\s*$/{$d;N;ba' -e '}')
+                if [[ -z "${cleaned// /}" ]]; then
+                    new_overlay=$(printf '%s' "$current_overlay" \
+                        | jq 'del(.agents.defaults.systemPromptOverride)')
+                else
+                    new_overlay=$(printf '%s' "$current_overlay" \
+                        | jq --arg sp "$cleaned" '.agents.defaults.systemPromptOverride = $sp')
+                fi
+                printf '%s' "$new_overlay" \
+                    | run_droplet "cat > /tmp/config.user.json"
+                run_droplet "docker cp /tmp/config.user.json ${CONTAINER}:/app/workspace/.openclaw/config.user.json && rm -f /tmp/config.user.json"
+                note "  stripped shared-folder fragment from systemPromptOverride"
+            fi
+        fi
+    fi
+fi
+
+# ── 4. restart so overlay change takes effect ──────────────────────
+note "phase 4/4 — restart ${CONTAINER} (skip with --no-restart)"
+if [[ "$NO_RESTART" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+    state=$(run_droplet "docker inspect -f '{{.State.Status}}' ${CONTAINER}" 2>/dev/null || true)
+    if [[ "$state" == "running" ]]; then
+        run_droplet "docker restart ${CONTAINER}" >/dev/null
+    fi
+fi
+
+note "✅ deprovisioned ${POD_LABEL}"
