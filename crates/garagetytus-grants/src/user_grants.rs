@@ -81,6 +81,13 @@ pub struct UserGrant {
     /// grants remain revocable by the same caller that created them.
     #[serde(default)]
     pub owner: String,
+    /// Phase 3 (multi-bot subagents) — optional binding to the
+    /// originating subagent slot id. `None` = machine-global grant
+    /// (back-compat with pre-Phase-3 records). When `Some(slot)`
+    /// the grant is only visible to dispatches whose
+    /// `MAKAKOO_AGENT_SLOT` / `X-Makakoo-Agent-Id` matches `slot`.
+    #[serde(default)]
+    pub bound_to_agent: Option<String>,
 }
 
 fn default_granted_by() -> String {
@@ -103,6 +110,27 @@ impl UserGrant {
             return false;
         };
         glob_match(glob, abs_path)
+    }
+
+    /// Phase 3: is this grant visible to a dispatch attributed to
+    /// `caller_agent_id`?  Logic:
+    ///
+    ///   - Grant has no `bound_to_agent` (`None`) → machine-global
+    ///     → visible to any caller (back-compat with pre-Phase-3
+    ///     records).
+    ///   - Grant is bound to an agent + caller is that agent →
+    ///     visible.
+    ///   - Grant is bound to an agent + caller is a different
+    ///     agent (or no agent attribution) → invisible.
+    ///
+    /// `caller_agent_id = None` represents a CLI / human / non-agent
+    /// dispatch — bound grants are invisible to those.
+    pub fn visible_to(&self, caller_agent_id: Option<&str>) -> bool {
+        match (&self.bound_to_agent, caller_agent_id) {
+            (None, _) => true,
+            (Some(bound), Some(caller)) => bound == caller,
+            (Some(_), None) => false,
+        }
     }
 }
 
@@ -441,7 +469,55 @@ mod tests {
             plugin: "cli".into(),
             origin_turn_id: "".into(),
             owner: "cli".into(),
+            bound_to_agent: None,
         }
+    }
+
+    #[test]
+    fn unbound_grant_visible_to_anyone() {
+        let g = base_grant("g1", "fs/write:/tmp/x", None);
+        assert!(g.visible_to(None));
+        assert!(g.visible_to(Some("harveychat")));
+        assert!(g.visible_to(Some("career")));
+    }
+
+    #[test]
+    fn bound_grant_visible_only_to_matching_agent() {
+        let mut g = base_grant("g1", "fs/write:/tmp/x", None);
+        g.bound_to_agent = Some("harveychat".into());
+        assert!(g.visible_to(Some("harveychat")));
+        assert!(!g.visible_to(Some("career")));
+        assert!(!g.visible_to(None));
+    }
+
+    #[test]
+    fn bound_grant_with_unattributed_call_invisible() {
+        // A CLI/human dispatch (no agent attribution) cannot
+        // exercise an agent-bound grant. Phase 3 spec.
+        let mut g = base_grant("g1", "fs/write:/tmp/x", None);
+        g.bound_to_agent = Some("secretary".into());
+        assert!(!g.visible_to(None));
+    }
+
+    #[test]
+    fn legacy_grant_serdes_back_compat_without_bound_to_agent() {
+        // Pre-Phase-3 JSON: no bound_to_agent field. Must
+        // deserialize cleanly and present as machine-global
+        // (visible to anyone).
+        let json = r#"{
+            "id": "old-grant",
+            "scope": "fs/write:/tmp/x",
+            "created_at": "2026-04-21T09:30:00Z",
+            "expires_at": null,
+            "label": "legacy",
+            "granted_by": "sebastian",
+            "plugin": "cli",
+            "origin_turn_id": "",
+            "owner": "cli"
+        }"#;
+        let g: UserGrant = serde_json::from_str(json).unwrap();
+        assert!(g.bound_to_agent.is_none());
+        assert!(g.visible_to(Some("any-agent")));
     }
 
     #[test]
