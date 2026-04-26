@@ -33,11 +33,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+WORKDIR_BASE="${HOME}/.cache/garagetytus/bisync"
+
 shopt -s nullglob
 plists=("${PLIST_DIR}"/com.traylinx.garagetytus.bisync.*.plist)
+sidecars=("${WORKDIR_BASE}"/*.bindings.json)
 shopt -u nullglob
 
-if [[ "${#plists[@]}" -eq 0 ]]; then
+if [[ "${#plists[@]}" -eq 0 && "${#sidecars[@]}" -eq 0 ]]; then
     if [[ "$JSON" -eq 1 ]]; then echo '[]'
     else echo "(no folder bindings registered)" >&2; fi
     exit 0
@@ -53,14 +56,23 @@ probe_label() {
         | awk -v L="$label" '$3==L {print $1" "$2; exit}'
 }
 
-# Collect rows
+# Build a deduped row set from BOTH plists (auto-sync bindings) and
+# sidecar JSONs (every binding since v0.5.3, including non-auto-sync).
+# Without the sidecar pass, bindings made via `folder bind <path>
+# <bucket>` (no --auto-sync) would be invisible to this command —
+# fixed in v0.5.4 alongside the matching unbind fix.
 declare -a rows=()
+declare -A seen_safe=()
+
+# Pass 1: plists (covers --auto-sync bindings; reads the live
+# launchctl state + log mtime).
 for plist in "${plists[@]}"; do
     label=$(basename "$plist" .plist)
     safe_name="${label#com.traylinx.garagetytus.bisync.}"
     args=$(plutil -convert json -o - "$plist" 2>/dev/null \
         | jq -r '.ProgramArguments[3] // ""')
     [[ -z "$args" ]] && continue
+    seen_safe[$safe_name]=1
 
     # Args looks like:
     # /usr/local/bin/timeout 45 /usr/local/bin/rclone --config "..." bisync "<LOCAL>" "garagetytus:<BUCKET>" --workdir ...
@@ -105,6 +117,32 @@ for plist in "${plists[@]}"; do
         fi
     fi
 
+    rows+=("$(jq -nc \
+        --arg bucket "$bucket" \
+        --arg local "$local_path" \
+        --arg label "$label" \
+        --arg state "$state" \
+        --arg interval "$interval" \
+        --arg last_sync "$mtime" \
+        --arg age "$age" \
+        '{bucket:$bucket, local_path:$local, label:$label,
+          state:$state, interval_sec:($interval|tonumber? // 0),
+          last_sync:$last_sync, last_sync_age:$age}')")
+done
+
+# Pass 2: sidecars not already covered by Pass 1 (non-auto-sync binds).
+# State = "no auto-sync" (no plist, no launchctl entry, no log mtime).
+for sidecar in "${sidecars[@]}"; do
+    sname=$(basename "$sidecar" .bindings.json)
+    [[ -n "${seen_safe[$sname]:-}" ]] && continue
+    bucket=$(jq -r '.bucket // ""' "$sidecar" 2>/dev/null)
+    local_path=$(jq -r '.local_path // ""' "$sidecar" 2>/dev/null)
+    [[ -z "$bucket" || -z "$local_path" ]] && continue
+    label="(sidecar-only)"
+    state="no auto-sync"
+    interval=0
+    mtime="never"
+    age="never"
     rows+=("$(jq -nc \
         --arg bucket "$bucket" \
         --arg local "$local_path" \

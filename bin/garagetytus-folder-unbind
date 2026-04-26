@@ -75,16 +75,26 @@ case "$LOCAL_PATH" in
     *)  LOCAL_PATH="$(pwd)/${LOCAL_PATH}";;
 esac
 
-# Find the matching plist by parsing ProgramArguments. Multiple binds
-# could in principle reference the same local path with different
-# buckets — collect them all.
+# Discover bindings two ways and dedupe by safe-name:
+#   1. Launchd plists (covers --auto-sync bindings).
+#   2. Sidecar JSONs (covers ALL bindings since v0.5.3, including
+#      bindings made WITHOUT --auto-sync that have no plist).
+#
+# Without (2), bindings made via `folder bind <path> <bucket>` (no
+# --auto-sync) leak as orphan sidecars: phase 1 finds nothing to
+# clean and the sidecar JSON sticks around forever. Caught after
+# v0.5.5 grandma-flow dogfood; fixed here in v0.5.4.
 shopt -s nullglob
 all_plists=("${PLIST_DIR}"/com.traylinx.garagetytus.bisync.*.plist)
+all_sidecars=("${WORKDIR_BASE}"/*.bindings.json)
 shopt -u nullglob
 
-declare -a matched_plists=()
-declare -a matched_buckets=()
-declare -a matched_safe_names=()
+declare -a matched_plists=()           # plist files (only present for --auto-sync binds)
+declare -a matched_buckets=()          # bucket per matched binding (1:1 with safe_names)
+declare -a matched_safe_names=()       # safe-names (deduped union of plist + sidecar)
+declare -A seen_safe_names=()          # dedupe set
+
+# Pass 1: plists
 for plist in "${all_plists[@]}"; do
     args=$(plutil -convert json -o - "$plist" 2>/dev/null \
         | jq -r '.ProgramArguments[3] // ""')
@@ -97,11 +107,25 @@ for plist in "${all_plists[@]}"; do
         matched_plists+=("$plist")
         matched_buckets+=("$plist_bucket")
         label=$(basename "$plist" .plist)
-        matched_safe_names+=("${label#com.traylinx.garagetytus.bisync.}")
+        sname="${label#com.traylinx.garagetytus.bisync.}"
+        matched_safe_names+=("$sname")
+        seen_safe_names[$sname]=1
     fi
 done
 
-if [[ "${#matched_plists[@]}" -eq 0 ]]; then
+# Pass 2: sidecars (skip ones already discovered via plist)
+for sidecar in "${all_sidecars[@]}"; do
+    side_local=$(jq -r '.local_path // ""' "$sidecar" 2>/dev/null)
+    side_bucket=$(jq -r '.bucket // ""' "$sidecar" 2>/dev/null)
+    [[ -z "$side_local" || "$side_local" != "$LOCAL_PATH" ]] && continue
+    fname=$(basename "$sidecar" .bindings.json)
+    [[ -n "${seen_safe_names[$fname]:-}" ]] && continue
+    matched_buckets+=("$side_bucket")
+    matched_safe_names+=("$fname")
+    seen_safe_names[$fname]=1
+done
+
+if [[ "${#matched_safe_names[@]}" -eq 0 ]]; then
     note "no folder bindings registered for ${LOCAL_PATH}"
     # Idempotent: continue to optional cleanup phases
 fi
@@ -143,20 +167,30 @@ run_garage() {
                  nsenter -t \$WPID -n -- /root/.local/bin/garage -c ${DROPLET_CONFIG} $*"
 }
 
-# ── 1. unload + remove launchd plists ──────────────────────────────
-note "phase 1/5 — unload + remove launchd plists"
-for i in "${!matched_plists[@]}"; do
-    plist="${matched_plists[$i]}"
-    safe_name="${matched_safe_names[$i]}"
+# ── 1. unload + remove launchd plists, workdirs, sidecars ─────────
+# Iterate the deduped safe_names (covers BOTH plist-backed and
+# sidecar-only bindings). The plist path is deterministic from the
+# safe_name; if it exists we unload + rm, otherwise we just clean
+# workdir + logs + sidecar (no plist for non-auto-sync binds).
+note "phase 1/5 — unload + remove launchd plists, workdirs, sidecars"
+for safe_name in "${matched_safe_names[@]}"; do
+    plist="${PLIST_DIR}/com.traylinx.garagetytus.bisync.${safe_name}.plist"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        note "  dry: would unload + rm ${plist}"
+        if [[ -f "$plist" ]]; then
+            note "  dry: would unload + rm ${plist} + workdir + sidecar (${safe_name})"
+        else
+            note "  dry: would rm workdir + sidecar (${safe_name}, no plist)"
+        fi
     else
-        launchctl unload "$plist" 2>/dev/null || true
-        rm -f "$plist"
+        if [[ -f "$plist" ]]; then
+            launchctl unload "$plist" 2>/dev/null || true
+            rm -f "$plist"
+            note "  unloaded + removed plist for ${safe_name}"
+        fi
         rm -rf "${WORKDIR_BASE}/${safe_name}"
         rm -f "${LOG_BASE}-${safe_name}.log" "${LOG_BASE}-${safe_name}.err"
         rm -f "${WORKDIR_BASE}/${safe_name}.bindings.json"
-        note "  removed plist + workdir + sidecar for ${safe_name}"
+        note "  removed workdir + sidecar for ${safe_name}"
     fi
 done
 
