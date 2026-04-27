@@ -1,13 +1,37 @@
 # garagetytus
 
-> Local S3 daemon for every dev laptop. Standalone Mac + Linux. Powered
-> by [Garage](https://garagehq.deuxfleurs.fr/) under the hood, but
-> garagetytus owns the install + daemon lifecycle + grants surface.
+> S3 daemon for dev laptops AND the Tytus shared multi-tenant service.
+> Powered by [Garage](https://garagehq.deuxfleurs.fr/) under the hood,
+> but garagetytus owns the install + daemon lifecycle + grants surface
+> + (since 2026-04-26) the public HTTPS reverse-proxy + ACME cert
+> management for the Tytus deployment.
 
-**Status: v0.1.0-rc2 (pre-release, 2026-04-25).** Source-build
-install only — Homebrew tap and `garagetytus.dev/install` web
-bootstrap land at the v0.1.0 (non-rc) tag once cargo-dist
-artifacts ship.
+**Status: v0.1.0-rc2 (pre-release, 2026-04-25)** + v0.5.4 shipped
+features (shared folders, parallel pod-provision, sidecar metadata)
++ Tytus public HTTPS endpoint live since 2026-04-26.
+
+**`garage-store` plugin default-bundled in Makakoo OS** `core` +
+`sebastian` distros (since 2026-04-27 — sprint
+`2026-04-27-garagetytus-default-bundle.md`). The plugin manifest
+ships with the default install; the `garagetytus` binary itself is
+still a separate one-liner install (`brew install traylinx/tap/garagetytus`
+or the curl recipe). Soft-fails cleanly when the binary is missing.
+
+## Two ways to use garagetytus
+
+**(a) Standalone on your laptop** — one binary, `127.0.0.1:3900`,
+no internet exposure. Each developer runs their own daemon. Install
+path below.
+
+**(b) Tytus shared service** — one garagetytus daemon on the Tytus
+droplet, exposed publicly at
+[`https://garagetytus.traylinx.com`](https://garagetytus.traylinx.com)
+through Caddy + Let's Encrypt. Tytus pods reach it via WireGuard
+sidecar (`http://10.42.42.1:3900`). External clients (customer Macs,
+SDKs, CI, third-party agents) reach it via HTTPS with SigV4. Same
+daemon, two reach paths. See `docs/MANUAL.md` §16 for the operator
+details and `docs/integrate/external-app.md` for the client-side
+recipe.
 
 ## Install (v0.1.0-rc2 — one-liner)
 
