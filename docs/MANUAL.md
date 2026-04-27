@@ -28,6 +28,8 @@ end-to-end the first time; bookmark §11 (troubleshooting) and §13
 13. [Integrating with Makakoo + tytus + your own app](#13-integrating-with-makakoo--tytus--your-own-app)
 14. [Configuration reference](#14-configuration-reference)
 15. [Uninstall](#15-uninstall)
+16. [Public HTTPS endpoint via Caddy (Tytus shared service)](#16-public-https-endpoint-via-caddy-tytus-shared-service)
+17. [Health-check semantics — read this if a bot reports "garage down"](#17-health-check-semantics--read-this-if-a-bot-reports-garage-down)
 16. [Versioning, upgrades, AGPL posture](#16-versioning-upgrades-agpl-posture)
 
 ---
@@ -1059,3 +1061,207 @@ For agent-driven workflows (Claude / Gemini / Codex / pi / etc.),
 see the four SKILL.md files in `skills/garagetytus-{install,
 bootstrap,daily-ops,troubleshoot}/` — each carries a decision
 tree that an AI agent can read and execute autonomously.
+
+---
+
+## 16. Public HTTPS endpoint via Caddy (Tytus shared service)
+
+> **Status: LIVE 2026-04-26.** This section describes the
+> *Tytus-hosted shared* deployment of garagetytus, distinct from the
+> per-laptop standalone install above. Standalone garagetytus binds
+> `127.0.0.1:3900` and stays loopback-only; the Tytus shared service
+> exposes a single public HTTPS endpoint backed by the same daemon.
+
+The Tytus team operates one garagetytus daemon on a Strato droplet
+that serves all Tytus pods AND any external client (customer Mac,
+SDK, CI, third-party agent) that holds a valid SigV4 key. Public
+URL:
+
+```
+https://garagetytus.traylinx.com
+```
+
+### Architecture
+
+```
+┌─────────────── Strato droplet (212.227.205.146) ───────────────┐
+│                                                                  │
+│   Caddy v2.11+    :443  ─┐                                       │
+│   (Let's Encrypt) :80    │                                       │
+│                          ▼  reverse_proxy (Host preserved)       │
+│   garagetytus daemon  127.0.0.1:3900     ┌───── Tytus pods ─────│
+│                       127.0.0.1:3901    ─┤   (read via socat    │
+│                       127.0.0.1:3903     │    in wannolot-NN    │
+│                                          │    netns; same       │
+│   UFW: deny 3900/3901/3903 from public   │    daemon, loopback) │
+│   Garage stays loopback-only.            │                      │
+└──────────────────────────────────────────┴──────────────────────┘
+```
+
+Same daemon serves two reach paths:
+
+- **Pod-side reach** (unchanged from v0.5.x): pods connect to
+  `http://10.42.42.1:3900` which is socat-forwarded into the
+  garage daemon via the wannolot-NN sidecar netns.
+- **Public reach** (new 2026-04-26): any client with a valid
+  per-bucket SigV4 key connects to
+  `https://garagetytus.traylinx.com` from anywhere on the public
+  internet, no WireGuard.
+
+### Caddyfile (operator reference)
+
+`/etc/caddy/Caddyfile`:
+
+```caddy
+{
+    email <ops-email>
+}
+
+garagetytus.traylinx.com {
+    encode zstd gzip
+
+    # Caddy preserves Host header by default — DO NOT add
+    # `header_up Host` overrides here; SigV4 validates the Host
+    # the client signed.
+    reverse_proxy 127.0.0.1:3900 {
+        flush_interval -1
+        transport http {
+            read_timeout 300s
+            write_timeout 300s
+            dial_timeout 10s
+        }
+    }
+}
+```
+
+Notes:
+
+- `flush_interval -1` is required for streaming uploads /
+  multipart so Caddy doesn't buffer the whole body.
+- Read/write timeouts at 300s accommodate large objects.
+- Host preservation is the load-bearing detail. AWS S3 SigV4
+  signs the Host header; if Caddy rewrites it, every signed
+  request fails with `SignatureDoesNotMatch`. Caddy preserves
+  Host by default.
+- Cert provisioning uses `tls-alpn-01` ACME challenge (Caddy's
+  default when port 443 is reachable), NOT HTTP-01.
+
+### Cert renewal
+
+Caddy auto-renews. No cron, no certbot, no operator action
+required. Verify health:
+
+```bash
+echo | openssl s_client -servername garagetytus.traylinx.com \
+  -connect garagetytus.traylinx.com:443 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+```
+
+If renewal ever fails, watch:
+
+```bash
+journalctl -u caddy -f | grep -E "tls\.(obtain|renew|cache)"
+```
+
+### Verifying a deploy from outside
+
+```bash
+# Endpoint health (correct response = HTTP 403 Garage anonymous-deny)
+curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://garagetytus.traylinx.com/
+
+# Signed round-trip via boto3 (use any per-bucket key already minted)
+python3 -c '
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3",
+    endpoint_url="https://garagetytus.traylinx.com",
+    aws_access_key_id="<access>", aws_secret_access_key="<secret>",
+    region_name="garage",
+    config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"))
+print(s3.list_buckets())
+'
+```
+
+### Firewall posture (UFW + iptables)
+
+The Strato droplet's UFW rules:
+
+```
+22/tcp    ALLOW Anywhere        # SSH
+80/tcp    ALLOW Anywhere        # ACME HTTP-01 (also serves redirect to HTTPS)
+443/tcp   ALLOW Anywhere        # Caddy → Garage
+51801/udp ALLOW Anywhere        # WireGuard (per-pod range)
+…
+3900/tcp  (no rule = denied implicitly)
+3901/tcp  (no rule = denied implicitly)
+3903/tcp  (no rule = denied implicitly)
+18080/tcp DENY Anywhere         # AIL gateway, never public
+```
+
+External port scan must show only 22 / 80 / 443 (plus the
+WireGuard UDP range). If any of `3900 / 3901 / 3903 / 18080`
+ever respond from outside the droplet, that is a
+critical-severity hardening regression — re-bind the offender
+to `127.0.0.1` and re-add the UFW deny.
+
+---
+
+## 17. Health-check semantics — read this if a bot reports "garage down"
+
+A surprising number of "garage is down" reports turn out to be
+agents misinterpreting Garage's deliberate response to anonymous
+probes. Garage requires SigV4-signed requests for every operation
+including `/health`. An anonymous GET returns:
+
+```
+HTTP/1.1 403 Forbidden
+<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>AccessDenied</Code>
+  <Message>Forbidden: Garage does not support anonymous access yet</Message>
+  <Resource>/</Resource>
+  <Region>garage</Region>
+</Error>
+```
+
+**This response means Garage is up and healthy.** The fact that
+TCP connected and HTTP returned a *structured* 403 with a Garage
+XML body proves the daemon is listening and responsive. Treat
+HTTP 403 with this body as a 200 from any other API.
+
+### Symptoms that ARE real outages
+
+| Symptom | What it means |
+|---|---|
+| `curl --max-time 5` exits code 28 (timeout) | TCP can't connect — daemon down OR firewall regression OR DNS broken |
+| `curl` exits code 7 (connection refused) | Daemon down OR not bound to expected port |
+| `curl` returns HTML (not Garage XML) | Reverse proxy misconfigured — request didn't reach Garage |
+| boto3 `EndpointConnectionError` / `ConnectTimeoutError` | Network-layer outage |
+| `502 Bad Gateway` from Caddy | Caddy is up, Garage daemon is dead — `systemctl restart garage` |
+
+### Symptoms that are NOT outages (do not page on these)
+
+| Symptom | What it really means |
+|---|---|
+| HTTP 403 with Garage `AccessDenied` XML | Healthy — sign your request |
+| Empty bucket list (200 with no `Contents`) | Healthy — bucket has no objects |
+| `SignatureDoesNotMatch` on a signed call | Clock skew OR wrong key — credential issue, not Garage |
+| `NoSuchBucket` | Caller has wrong bucket name OR no grant — auth issue |
+| `403 Forbidden — RequestTimeTooSkewed` | Caller's clock is off by >15min |
+
+### Reporting requirements for any "garage down" claim
+
+When an agent (bot, MCP tool, CLI, whatever) reports an outage,
+the report **must** include:
+
+1. The exact command that was run.
+2. Its exit code.
+3. The verbatim stderr (first 500 chars).
+4. The timestamp of the probe (ISO 8601 UTC).
+
+Reports without these four fields are **inadmissible**. The
+agent should say *"I don't know the status; I haven't probed it"*
+instead of guessing. This rule lives in
+`MAKAKOO/bootstrap/global.md` under `## Identity (hard rules)`
+and rides every CLI host (Claude / Gemini / Codex / OpenCode /
+Vibe / Cursor / Qwen / pi).

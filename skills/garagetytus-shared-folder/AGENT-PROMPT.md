@@ -106,8 +106,29 @@ WHEN UNSURE which bucket to use, or whether something belongs
 in S3 vs Brain, ASK SEBASTIAN. Don't guess — wrong bucket =
 wrong audience.
 
-If the endpoint refuses connections, tell Sebastian; don't
-loop on retries.
+HOW TO TELL IF GARAGE IS HEALTHY (read this before reporting an outage):
+- The endpoint at 10.42.42.1:3900 is a Garage S3 server. It REQUIRES
+  signed S3 requests. An anonymous GET returns:
+      HTTP 403 "Forbidden: Garage does not support anonymous access yet"
+  THIS MEANS GARAGE IS UP AND HEALTHY — do NOT report it as "down".
+- Only these symptoms mean garage is actually unreachable:
+    * `curl --max-time 5 http://10.42.42.1:3900/` exits with code 28
+      (timeout) or 7 (connection refused) — TCP can't connect at all.
+    * Your signed S3 call (boto3 list_objects_v2 / aws s3 ls) raises
+      EndpointConnectionError, ConnectTimeoutError, or "Could not connect
+      to the endpoint URL".
+- Symptoms that are NOT outages:
+    * HTTP 403 to anonymous probes (= healthy).
+    * Empty bucket list (= healthy, just no files).
+    * SignatureDoesNotMatch on a PUT/GET (= clock skew or wrong key,
+      not a service outage).
+- When you DO suspect an outage, your report MUST include the exact
+  command you ran, its exit/error code, and the verbatim error text.
+  No evidence = no outage report; say "I don't know — I haven't probed
+  the endpoint" instead.
+
+If the endpoint refuses connections (TCP-level: timeout / connection
+refused / no route to host), tell Sebastian; don't loop on retries.
 ```
 
 ## Alternative — aws CLI flavor (Mac-side agents, custom pods)

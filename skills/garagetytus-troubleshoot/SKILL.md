@@ -179,9 +179,42 @@ lives in the config dir which gets wiped.
 - **Touch the user's network or system clock.** Clock-skew fixes
   go through the OS (sntp / chronyc), not garagetytus.
 
+## ⚠️ Hard rule — health-check semantics
+
+**`HTTP 403 "Forbidden: Garage does not support anonymous access yet"`
+is the *healthy* response.** Garage requires SigV4-signed requests
+for every operation including `/health`. An anonymous probe gets
+a structured 403 with that exact XML body — that proves the daemon
+is up, listening, and responding. Do NOT report it as "down".
+
+The same rule applies to the Tytus shared service at
+`https://garagetytus.traylinx.com` — the public Caddy endpoint
+proxies the same anonymous-deny response through unchanged.
+
+Real outage signatures:
+
+- `curl --max-time 5` exits 28 (timeout) or 7 (connection refused).
+- HTTP `502 Bad Gateway` from Caddy (Garage daemon dead behind it).
+- boto3 `EndpointConnectionError` / `ConnectTimeoutError`.
+
+Symptoms that are NOT outages:
+
+- HTTP 403 with Garage `AccessDenied` XML body (= healthy).
+- `SignatureDoesNotMatch` (= clock skew or wrong key).
+- `NoSuchBucket` (= grant missing or wrong name).
+- Empty bucket list (= bucket has no objects, healthy).
+
+When you DO suspect an outage, your report to the user MUST
+include: (1) exact command run, (2) exit code, (3) verbatim
+stderr first 500 chars, (4) ISO 8601 UTC timestamp. Reports
+without these four fields are inadmissible — say "I don't know
+the status; I haven't probed it" instead of guessing. This rule
+lives in `MAKAKOO/bootstrap/global.md` and rides every CLI host.
+
 ## See also
 
-- Manual: `docs/MANUAL.md` §11 (full troubleshooting matrix).
+- Manual: `docs/MANUAL.md` §11 (full troubleshooting matrix),
+  §16 (public HTTPS endpoint via Caddy), §17 (health-check semantics).
 - `garagetytus-install`, `garagetytus-bootstrap`,
   `garagetytus-daily-ops` — the workflows this skill supports.
 - `verdicts/Q3-AC8-RECOVERY.md` — what auto-repair does and

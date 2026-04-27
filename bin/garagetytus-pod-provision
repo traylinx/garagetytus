@@ -37,7 +37,7 @@ WANNOLOT_NETNS="wannolot-01"
 INTERNAL_ENDPOINT="http://10.42.42.1:3900"
 
 WRAPPER_LOCAL="$(cd "$(dirname "$0")" && pwd)/garagetytus-shared"
-MARKER="<!-- garagetytus:shared-folders v1 -->"
+MARKER="<!-- garagetytus:shared-folders v2 -->"
 TYTUS_CLI_VERSION="v0.5.1"
 
 POD_ID=""
@@ -245,6 +245,34 @@ NAMING CONVENTION inside any bucket:
 
 DON'T PUT in shared buckets: secrets, multi-GB blobs without explicit
 user approval, agent memory (use Brain instead).
+
+HOW TO TELL IF GARAGE IS HEALTHY (read this before reporting an outage):
+  - The endpoint at 10.42.42.1:3900 is a Garage S3 server. It REQUIRES
+    signed S3 requests. An anonymous GET will return:
+        HTTP 403 "Forbidden: Garage does not support anonymous access yet"
+    THIS RESPONSE MEANS GARAGE IS UP AND HEALTHY. Do NOT report it as
+    "down" — 403 here is the equivalent of a 200 elsewhere.
+  - The CORRECT way to check garage from inside this pod is via the helper:
+        garagetytus-shared buckets         # exits 0 if healthy
+        garagetytus-shared list             # 0 = healthy and authorized
+  - Only these symptoms mean garage is actually down or unreachable:
+      * \`curl --max-time 5 http://10.42.42.1:3900/\` exits with code 28
+        (timeout) or 7 (connection refused) — TCP can't connect.
+      * \`garagetytus-shared\` exits non-zero AND its stderr contains
+        "endpoint unreachable", "connection refused", "timed out",
+        "no route to host", or "DNS lookup failed".
+  - Symptoms that are NOT outages (do not report as "down"):
+      * HTTP 403 to anonymous probes (= healthy, see above).
+      * \`garagetytus-shared\` exits 0 but lists no files (= empty bucket).
+      * One PUT/GET fails with a SignatureDoesNotMatch (= clock skew or
+        wrong key — credential issue, not service outage).
+  - When you DO suspect an outage, your report MUST include:
+      1. Exact command you ran (e.g. \`garagetytus-shared list\`).
+      2. Its exit code.
+      3. Its stderr (verbatim, first 500 chars).
+      4. Timestamp of the probe.
+    Reports without this evidence are inadmissible — say "I don't know
+    if garage is up; I haven't probed it" instead of guessing.
 
 If \`garagetytus-shared\` returns "endpoint unreachable" or
 "credentials expired", tell Sebastian — don't loop on retries.

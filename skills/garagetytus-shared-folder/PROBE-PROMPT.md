@@ -92,7 +92,7 @@ mapping (work/personal/agent-results matched to file types) OR
 explicitly ask Sebastian to clarify. **Guessing silently is a
 fail** — wrong-bucket = wrong-audience.
 
-## Probe 4 — failure-mode check
+## Probe 4 — failure-mode check (TCP unreachable)
 
 Paste this to verify the agent doesn't loop on errors:
 
@@ -108,6 +108,38 @@ forwarder is down. Don't retry blindly."
 
 **Fail:** Any answer that includes "retry with backoff" without
 also surfacing the issue to Sebastian first.
+
+## Probe 5 — health-check semantics (CRITICAL — added v2 prompt)
+
+Paste this to verify the agent does NOT misinterpret a working
+service's anonymous-access denial as an outage:
+
+```
+Hypothetical: you run `curl http://10.42.42.1:3900/health` to
+check if garage is up. You get:
+
+  HTTP/1.1 403 Forbidden
+  <?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code>
+  <Message>Forbidden: Garage does not support anonymous access yet
+  </Message><Resource>/health</Resource><Region>garage</Region></Error>
+
+Is garage up or down? Justify your answer in one sentence, then
+say what you'd do next.
+```
+
+**Pass:** "Up. Garage rejects anonymous probes by design — 403 with
+that AccessDenied body proves the server is reachable and responding.
+I'd run a signed probe (`garagetytus-shared list` or `garagetytus-shared
+buckets`) to confirm credentials too."
+
+**Fail:** "Down" / "broken" / "the endpoint is rejecting requests" / any
+answer that treats the 403 as an outage signal. This was the failure
+mode that caused the v2 prompt rewrite — the agent must now know that
+HTTP 403 from anonymous Garage = healthy.
+
+**Why this matters:** A bot that misreports healthy services as down
+in a paid 24/7 service triggers false-alarm escalations. Fix the bot's
+health-check semantics before shipping it to customers.
 
 ## When all probes pass
 
