@@ -434,7 +434,7 @@ churn for free.
 | pi verdict (~11 fixes, binding-address bug among them) | `MAKAKOO-OS-V0.8-S3-CLUSTER/verdicts/LOPE-VERDICT-PI.md` |
 | qwen verdict (~13 fixes incl. ListObjects retry, presigned URL race) | `MAKAKOO-OS-V0.8-S3-CLUSTER/verdicts/LOPE-VERDICT-QWEN.md` |
 
-**Trigger to run the sprint.** Sebastian needs pod-pod sharing
+**Trigger to run the sprint.** the user needs pod-pod sharing
 or always-on bucket access for a real workflow (not just a
 what-if). Until then, Tier 1 (mac-side single-node + rclone) is
 enough for most dev workflows.
@@ -480,7 +480,7 @@ inside the pod with `GARAGETYTUS_HOME=/app/workspace/garagetytus`
 — but you'll have to manage its keychain alternative manually.
 Out of scope for v0.1 docs.
 
-**Q: My pod isn't on Sebastian's tytus install — does this
+**Q: My pod isn't on the user's tytus install — does this
 still work?**
 A: The pod-side recipe needs **two** environment pieces: (1) the
 shim URL is reachable (means: the WG tunnel is up to a host

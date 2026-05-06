@@ -835,7 +835,7 @@ fn grant(
         created_at: now,
         expires_at,
         label: label_text.clone(),
-        granted_by: "sebastian".into(),
+        granted_by: "owner".into(),
         plugin: PLUGIN.into(),
         origin_turn_id: String::new(),
         owner: PLUGIN.into(),

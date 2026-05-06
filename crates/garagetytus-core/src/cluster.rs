@@ -49,7 +49,7 @@ pub struct ClusterConfig {
     /// Pod-facing endpoint that pods route to over WG. Default
     /// `http://10.42.42.1:3900/` (the droplet's WG-bound S3 API).
     /// Q4 verdict added this as an override-friendly knob for
-    /// non-Sebastian deployments.
+    /// non-default deployments.
     pub pod_endpoint: String,
     /// Replication factor — number of object copies. v0.5 fixes
     /// at `2` (one per zone); higher counts queued for v0.9

@@ -37,7 +37,7 @@ aws s3 cp ./your-file.md s3://<bucket>/from-<pod-id>/your-file.md \
 
 ## One bucket = one shared folder
 
-The bucket NAME is the folder identity. Sebastian creates a
+The bucket NAME is the folder identity. the user creates a
 bucket per topic (`work`, `personal`, `agent-results`, etc.) and
 binds each one to a Mac local directory via `rclone bisync`. Each
 bucket is granted to specific pods.
@@ -54,7 +54,7 @@ aws s3api list-buckets \
 ```
 
 Don't write to a bucket you weren't granted, and **don't guess
-which bucket to use** — ask Sebastian if the right destination
+which bucket to use** — ask the user if the right destination
 isn't obvious from the task. Wrong bucket = wrong audience.
 
 ## Endpoint and credentials

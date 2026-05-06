@@ -13,7 +13,7 @@ single user. Use this for offline dev / CI / "S3 in a box."
 Tytus droplet, fronted by Caddy + Let's Encrypt at
 `https://garagetytus.traylinx.com`. Multi-tenant: per-bucket
 SigV4 keys minted by the Tytus orchestrator. Use this when you need
-to share files between Sebastian's Mac, multiple Tytus pods, and
+to share files between the user's Mac, multiple Tytus pods, and
 external clients (customer Macs, CI, third-party agents) without
 WireGuard.
 
@@ -121,7 +121,7 @@ garagetytus bucket revoke g_20260425_abc12def
 
 Grants live in `~/.garagetytus/grants.json` (Mac/Linux) or
 `%APPDATA%\garagetytus\grants.json` (Windows v0.2). The file is
-machine-local, gitignored, never synced. Sebastian's Makakoo
+machine-local, gitignored, never synced. The user's Makakoo
 host + tytus pod all read this same file (read-only) and
 honour the grants — see `docs/integrate/{makakoo,tytus}.md`.
 

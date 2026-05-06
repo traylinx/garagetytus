@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-    { name = "Sebastian Schkudlara", email = "sebastian@traylinx.com" },
+    { name = "Traylinx", email = "support@traylinx.com" },
 ]
 keywords = ["s3", "garage", "local", "object-storage", "boto3"]
 classifiers = [

@@ -88,7 +88,7 @@ caller injects control chars (LD#16).
       "created_at": "2026-04-25T12:42:00Z",
       "expires_at": "2026-04-25T13:42:00Z",
       "label": "my-app",
-      "granted_by": "sebastian",
+      "granted_by": "owner",
       "plugin": "cli",
       "origin_turn_id": "",
       "owner": "cli"

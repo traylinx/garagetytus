@@ -11,7 +11,7 @@ features (shared folders, parallel pod-provision, sidecar metadata)
 + Tytus public HTTPS endpoint live since 2026-04-26.
 
 **`garage-store` plugin default-bundled in Makakoo OS** `core` +
-`sebastian` distros (since 2026-04-27 — sprint
+`personal` distros (since 2026-04-27 — sprint
 `2026-04-27-garagetytus-default-bundle.md`). The plugin manifest
 ships with the default install; the `garagetytus` binary itself is
 still a separate one-liner install (`brew install traylinx/tap/garagetytus`

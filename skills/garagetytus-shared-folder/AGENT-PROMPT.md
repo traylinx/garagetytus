@@ -36,8 +36,8 @@ That's it. The agent now has the recipe for sharing files.
 
 ```
 You have access to a shared file system through a Garage S3
-bucket on Sebastian's droplet. Use this when you need to save
-a file Sebastian (or another pod) will see, or read a file
+bucket on the user's droplet. Use this when you need to save
+a file the user (or another pod) will see, or read a file
 they've added for you.
 
 ENDPOINT:    http://10.42.42.1:3900
@@ -50,7 +50,7 @@ REGION:      garage
 NOTE: This pod has boto3 (Python) installed but NOT the aws CLI.
 Use the Python recipes below — do not invent aws-cli commands.
 
-# How to PUT a file (Sebastian or other pods will see it):
+# How to PUT a file (the user or other pods will see it):
 python3 - <<'PY'
 import boto3
 from botocore.config import Config
@@ -78,7 +78,7 @@ for obj in s3.list_objects_v2(Bucket="<bucket-name>").get("Contents", []):
     print(f"{obj['Key']:50} {obj['Size']:>8} bytes")
 PY
 
-# How to GET a file Sebastian sent you:
+# How to GET a file the user sent you:
 python3 - <<'PY'
 import boto3
 from botocore.config import Config
@@ -94,7 +94,7 @@ PY
 
 NAMING CONVENTION inside this bucket:
 - Files YOU produce → prefix with from-<pod-name>/
-- Files Sebastian sent you → look in from-mac/
+- Files the user sent you → look in from-mac/
 - Files for ALL pods in this bucket → prefix with broadcast/
 
 WHAT NOT TO PUT IN THIS BUCKET:
@@ -103,7 +103,7 @@ WHAT NOT TO PUT IN THIS BUCKET:
 - Conversational memory or chat history (use Brain instead)
 
 WHEN UNSURE which bucket to use, or whether something belongs
-in S3 vs Brain, ASK SEBASTIAN. Don't guess — wrong bucket =
+in S3 vs Brain, ASK THE USER. Don't guess — wrong bucket =
 wrong audience.
 
 HOW TO TELL IF GARAGE IS HEALTHY (read this before reporting an outage):
@@ -128,7 +128,7 @@ HOW TO TELL IF GARAGE IS HEALTHY (read this before reporting an outage):
   the endpoint" instead.
 
 If the endpoint refuses connections (TCP-level: timeout / connection
-refused / no route to host), tell Sebastian; don't loop on retries.
+refused / no route to host), tell the user; don't loop on retries.
 ```
 
 ## Alternative — aws CLI flavor (Mac-side agents, custom pods)
@@ -187,10 +187,10 @@ For the multi-bucket case, append at the end:
 ```
 ROUTING — which bucket for which task:
 - work:          coding tasks, work-related files, project notes
-- personal:      anything personal Sebastian asked you to handle
-- agent-results: outputs you want OTHER pods (not Sebastian) to read
+- personal:      anything personal the user asked you to handle
+- agent-results: outputs you want OTHER pods (not the user) to read
 
-If a task doesn't clearly fit one of these, ASK SEBASTIAN.
+If a task doesn't clearly fit one of these, ASK THE USER.
 ```
 
 ## Filling the template programmatically

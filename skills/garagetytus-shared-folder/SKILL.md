@@ -59,7 +59,7 @@ default-marked bucket in your credentials), uses path-style
 addressing, retries up to 3x, and prints clear error messages
 if endpoint or credentials fail. **You never see access keys.**
 
-If the wrapper isn't installed, ask Sebastian to run on his Mac:
+If the wrapper isn't installed, ask the user to run on his Mac:
 
 ```bash
 garagetytus folder bind ~/Documents/<topic> <bucket> --to <your-pod-id>
@@ -92,11 +92,11 @@ wrapper above is the answer.
 ```
 
 **Each shared folder is a SEPARATE BUCKET.** The bucket name IS
-the folder identity. Sebastian creates a bucket per topic
+the folder identity. The user creates a bucket per topic
 (`work`, `personal`, `agent-results`, etc.) and grants each one
 to specific pods. Your pod sees a bucket only if it has been
 granted access. Different files in the wrong bucket = wrong
-audience seeing them — when in doubt, **ask Sebastian which
+audience seeing them — when in doubt, **ask the user which
 bucket to write to**.
 
 ## Step 0 — discover which buckets your pod can use
@@ -130,15 +130,15 @@ the bucket name to `shared` — substitute yours where it appears.
 | Task | Bucket |
 |---|---|
 | Drop a work-related file the user will see in `~/Documents/work` | `work` |
-| Hand off a result to another agent | `agent-results` (or whatever Sebastian uses) |
-| Broadcast to all pods | `broadcast` if granted, otherwise the all-pods bucket Sebastian named |
-| Unsure | Ask Sebastian. Don't guess. |
+| Hand off a result to another agent | `agent-results` (or whatever the user uses) |
+| Broadcast to all pods | `broadcast` if granted, otherwise the all-pods bucket the user named |
+| Unsure | Ask the user. Don't guess. |
 
 ## Quick recipe — drop a file the user will see
 
 ```bash
 . /etc/garagetytus.env
-BUCKET=work        # ← the bucket Sebastian wants this kind of file in
+BUCKET=work        # ← the bucket the user wants this kind of file in
 POD=$(hostname)    # ← e.g. "wannolot-02" → tells the user which pod produced it
 
 aws s3 cp ./report.md s3://$BUCKET/from-$POD/report-$(date +%s).md \
@@ -146,7 +146,7 @@ aws s3 cp ./report.md s3://$BUCKET/from-$POD/report-$(date +%s).md \
     --region garage --profile s3-service
 ```
 
-Within seconds (or as soon as Sebastian's `rclone bisync`
+Within seconds (or as soon as the user's `rclone bisync`
 runs against that bucket), the file appears in
 `~/Documents/$BUCKET/from-$POD/report-….md` on Mac.
 

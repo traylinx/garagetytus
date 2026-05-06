@@ -91,7 +91,7 @@ pub struct UserGrant {
 }
 
 fn default_granted_by() -> String {
-    "sebastian".into()
+    "owner".into()
 }
 fn default_plugin() -> String {
     "cli".into()
@@ -465,7 +465,7 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 4, 21, 9, 30, 0).unwrap(),
             expires_at: expires,
             label: "t".into(),
-            granted_by: "sebastian".into(),
+            granted_by: "owner".into(),
             plugin: "cli".into(),
             origin_turn_id: "".into(),
             owner: "cli".into(),
@@ -510,7 +510,7 @@ mod tests {
             "created_at": "2026-04-21T09:30:00Z",
             "expires_at": null,
             "label": "legacy",
-            "granted_by": "sebastian",
+            "granted_by": "owner",
             "plugin": "cli",
             "origin_turn_id": "",
             "owner": "cli"
@@ -544,7 +544,7 @@ mod tests {
         let mut u = UserGrants::empty_at(p.clone());
         u.add(base_grant(
             "g_20260421_a",
-            "fs/write:/Users/sebastian/code/**",
+            "fs/write:/Users/owner/code/**",
             Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
         ));
         u.save().unwrap();
@@ -578,7 +578,7 @@ mod tests {
             "fs/write:/tmp/**",
             Some(now - Duration::minutes(10)),
         ));
-        u.add(base_grant("active", "fs/write:/Users/sebastian/code/**", None));
+        u.add(base_grant("active", "fs/write:/Users/owner/code/**", None));
         let removed = u.purge_expired(now);
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].id, "expired");
@@ -592,11 +592,11 @@ mod tests {
         let mut u = UserGrants::empty_at(default_path(home.path()));
         u.add(base_grant(
             "g1",
-            "fs/write:/Users/sebastian/code/**",
+            "fs/write:/Users/owner/code/**",
             None,
         ));
         let now = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
-        let m = u.match_write_path("/Users/sebastian/code/src/lib.rs", None, now);
+        let m = u.match_write_path("/Users/owner/code/src/lib.rs", None, now);
         assert!(m.is_some());
         assert_eq!(m.unwrap().id, "g1");
     }
@@ -605,10 +605,10 @@ mod tests {
     fn match_write_path_rejects_outside_scope() {
         let home = mk_home();
         let mut u = UserGrants::empty_at(default_path(home.path()));
-        u.add(base_grant("g1", "fs/write:/Users/sebastian/code/**", None));
+        u.add(base_grant("g1", "fs/write:/Users/owner/code/**", None));
         let now = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
         assert!(u
-            .match_write_path("/Users/sebastian/other/lib.rs", None, now)
+            .match_write_path("/Users/owner/other/lib.rs", None, now)
             .is_none());
     }
 

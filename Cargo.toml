@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Sebastian Schkudlara <sebastian@traylinx.com>"]
+authors = ["Traylinx <support@traylinx.com>"]
 license = "MIT"
 repository = "https://github.com/traylinx/garagetytus"
 homepage = "https://garagetytus.dev"

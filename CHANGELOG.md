@@ -259,7 +259,7 @@ versions follow [SemVer](https://semver.org/).
   restart, sentinel.lock orphan-PID detection increments
   `unclean_shutdown_total`, auto-repair flow shells
   `garage repair tables`). All code paths are in place;
-  empirical verification is Sebastian-side per the recipe in
+  empirical verification is operator-side per the recipe in
   `verdicts/Q3-AC8-RECOVERY.md`.
 - **AC3** — service registration with reboot survival on
   macOS + Linux.

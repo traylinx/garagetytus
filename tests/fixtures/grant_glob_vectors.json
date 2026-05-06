@@ -4,50 +4,50 @@
   "vectors": [
     {
       "name": "exact_match",
-      "scope_glob": "/Users/sebastian/code/README.md",
-      "path": "/Users/sebastian/code/README.md",
+      "scope_glob": "/Users/owner/code/README.md",
+      "path": "/Users/owner/code/README.md",
       "match": true
     },
     {
       "name": "exact_non_match",
-      "scope_glob": "/Users/sebastian/code/README.md",
-      "path": "/Users/sebastian/code/CHANGELOG.md",
+      "scope_glob": "/Users/owner/code/README.md",
+      "path": "/Users/owner/code/CHANGELOG.md",
       "match": false
     },
     {
       "name": "double_star_descends_one_level",
-      "scope_glob": "/Users/sebastian/code/**",
-      "path": "/Users/sebastian/code/foo.md",
+      "scope_glob": "/Users/owner/code/**",
+      "path": "/Users/owner/code/foo.md",
       "match": true
     },
     {
       "name": "double_star_descends_many_levels",
-      "scope_glob": "/Users/sebastian/code/**",
-      "path": "/Users/sebastian/code/a/b/c/d/e.md",
+      "scope_glob": "/Users/owner/code/**",
+      "path": "/Users/owner/code/a/b/c/d/e.md",
       "match": true
     },
     {
       "name": "double_star_does_not_match_parent",
-      "scope_glob": "/Users/sebastian/code/**",
-      "path": "/Users/sebastian/code",
+      "scope_glob": "/Users/owner/code/**",
+      "path": "/Users/owner/code",
       "match": false
     },
     {
       "name": "double_star_does_not_match_sibling",
-      "scope_glob": "/Users/sebastian/code/**",
-      "path": "/Users/sebastian/other/foo.md",
+      "scope_glob": "/Users/owner/code/**",
+      "path": "/Users/owner/other/foo.md",
       "match": false
     },
     {
       "name": "single_star_matches_one_segment",
-      "scope_glob": "/Users/sebastian/tmp/*",
-      "path": "/Users/sebastian/tmp/file.txt",
+      "scope_glob": "/Users/owner/tmp/*",
+      "path": "/Users/owner/tmp/file.txt",
       "match": true
     },
     {
       "name": "single_star_rejects_deeper_segment",
-      "scope_glob": "/Users/sebastian/tmp/*",
-      "path": "/Users/sebastian/tmp/sub/file.txt",
+      "scope_glob": "/Users/owner/tmp/*",
+      "path": "/Users/owner/tmp/sub/file.txt",
       "match": false
     },
     {
@@ -64,38 +64,38 @@
     },
     {
       "name": "double_star_extension_filter_hit",
-      "scope_glob": "/Users/sebastian/code/**/*.rs",
-      "path": "/Users/sebastian/code/src/main/lib.rs",
+      "scope_glob": "/Users/owner/code/**/*.rs",
+      "path": "/Users/owner/code/src/main/lib.rs",
       "match": true
     },
     {
       "name": "double_star_extension_filter_miss",
-      "scope_glob": "/Users/sebastian/code/**/*.rs",
-      "path": "/Users/sebastian/code/src/main/lib.py",
+      "scope_glob": "/Users/owner/code/**/*.rs",
+      "path": "/Users/owner/code/src/main/lib.py",
       "match": false
     },
     {
       "name": "path_with_spaces_hit",
-      "scope_glob": "/Users/sebastian/My Docs/**",
-      "path": "/Users/sebastian/My Docs/report.md",
+      "scope_glob": "/Users/owner/My Docs/**",
+      "path": "/Users/owner/My Docs/report.md",
       "match": true
     },
     {
       "name": "path_with_dots_hit",
-      "scope_glob": "/Users/sebastian/.config/**",
-      "path": "/Users/sebastian/.config/makakoo/grants.json",
+      "scope_glob": "/Users/owner/.config/**",
+      "path": "/Users/owner/.config/makakoo/grants.json",
       "match": true
     },
     {
       "name": "prefix_rejection",
-      "scope_glob": "/Users/sebastian/code/**",
-      "path": "/Users/sebastian/code-archive/legacy.md",
+      "scope_glob": "/Users/owner/code/**",
+      "path": "/Users/owner/code-archive/legacy.md",
       "match": false
     },
     {
       "name": "sibling_directory_rejection",
-      "scope_glob": "/Users/sebastian/a/**",
-      "path": "/Users/sebastian/ab/file.md",
+      "scope_glob": "/Users/owner/a/**",
+      "path": "/Users/owner/ab/file.md",
       "match": false
     },
     {
@@ -107,7 +107,7 @@
     },
     {
       "name": "empty_path_rejection",
-      "scope_glob": "/Users/sebastian/code/**",
+      "scope_glob": "/Users/owner/code/**",
       "path": "",
       "match": false
     }

@@ -15,7 +15,7 @@ Quick check on our shared file system:
 1. Which S3 bucket(s) do you have access to, and what's your
    pod identity?
 2. Show me the exact `aws s3 cp` command you'd run to save a
-   file called "hello-sebastian.md" so I see it on my Mac.
+   file called "hello-owner.md" so I see it on my Mac.
 3. Show me the exact command you'd run to list files I've put
    in from-mac/ for you.
 
@@ -31,7 +31,7 @@ NOT guess endpoints or credentials.
 - Use the `--profile garagetytus` flag (or equivalent inline
   `--access-key` arguments).
 - Prefix its output file with `from-<pod-id>/` (e.g.
-  `s3://testbucket/from-wannolot-02/hello-sebastian.md`) — NOT
+  `s3://testbucket/from-wannolot-02/hello-owner.md`) — NOT
   bare bucket root, NOT `from-mac/`.
 - For the LIST: `aws s3 ls s3://<bucket>/from-mac/ ...`
 
@@ -89,7 +89,7 @@ answer when the routing isn't obvious from the task.
 
 **Pass criteria** — the agent should either give a confident
 mapping (work/personal/agent-results matched to file types) OR
-explicitly ask Sebastian to clarify. **Guessing silently is a
+explicitly ask the user to clarify. **Guessing silently is a
 fail** — wrong-bucket = wrong-audience.
 
 ## Probe 4 — failure-mode check (TCP unreachable)
@@ -103,11 +103,11 @@ Hypothetical: you try to PUT a file and get
 What do you do?
 ```
 
-**Pass:** "Tell Sebastian; the WireGuard tunnel or droplet
+**Pass:** "Tell the user; the WireGuard tunnel or droplet
 forwarder is down. Don't retry blindly."
 
 **Fail:** Any answer that includes "retry with backoff" without
-also surfacing the issue to Sebastian first.
+also surfacing the issue to the user first.
 
 ## Probe 5 — health-check semantics (CRITICAL — added v2 prompt)
 
