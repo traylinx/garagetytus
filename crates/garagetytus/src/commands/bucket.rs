@@ -839,6 +839,7 @@ fn grant(
         plugin: PLUGIN.into(),
         origin_turn_id: String::new(),
         owner: PLUGIN.into(),
+        bound_to_agent: None,
     };
     let mut user_grants = user_grants_existing;
     user_grants.add(user_grant.clone());
