@@ -24,7 +24,7 @@ set -euo pipefail
 DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
 DROPLET_CONFIG="/var/lib/garagetytus/config/garagetytus.toml"
 WANNOLOT_NETNS="wannolot-01"
-EXTERNAL_ENDPOINT="http://10.42.42.1:3900"
+EXTERNAL_ENDPOINT="${GARAGETYTUS_ENDPOINT:-${GARAGETYTUS_EXTERNAL_ENDPOINT:-http://10.42.42.1:3900}}"
 RCLONE_REMOTE="garagetytus"
 RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -114,6 +114,30 @@ run_garage() {
                  nsenter -t \$WPID -n -- /root/.local/bin/garage -c ${DROPLET_CONFIG} $*"
 }
 
+ensure_rclone_endpoint() {
+    [[ "$DRY_RUN" -eq 0 ]] || return 0
+    [[ -f "$RCLONE_CONF" ]] || return 0
+    tmp="${RCLONE_CONF}.endpoint.$$"
+    awk -v r="[${RCLONE_REMOTE}]" -v endpoint="${EXTERNAL_ENDPOINT}" '
+        $0 == r { in_block=1; saw_endpoint=0; print; next }
+        in_block && /^\[/ {
+            if (!saw_endpoint) print "endpoint = " endpoint
+            in_block=0
+        }
+        in_block && /^endpoint[[:space:]]*=/ {
+            print "endpoint = " endpoint
+            saw_endpoint=1
+            next
+        }
+        { print }
+        END {
+            if (in_block && !saw_endpoint) print "endpoint = " endpoint
+        }
+    ' "$RCLONE_CONF" > "$tmp"
+    mv "$tmp" "$RCLONE_CONF"
+    chmod 600 "$RCLONE_CONF"
+}
+
 # ── 1. ensure bucket exists on droplet ─────────────────────────────
 note "phase 1/6 — ensure bucket exists"
 if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -189,6 +213,7 @@ RCEOF
     fi
 fi
 
+ensure_rclone_endpoint
 note "phase 3/6 — bucket-allow confirmed for ${BUCKET}"
 
 # ── 4. mkdir local path + initial bisync --resync ─────────────────
