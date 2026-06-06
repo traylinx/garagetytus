@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# garagetytus-folder-materialize — materialize a Garage shared bucket inside a Tytus pod.
+#
+# Usage:
+#   garagetytus-folder-materialize <pod-id> --bucket NAME [--slug SLUG] [--droplet HOST] [--dry-run]
+#
+# Copies legacy bucket-root objects into /app/workspace/shared/<slug>/.
+# This intentionally does not delete or modify the Mac-side source folder.
+
+set -euo pipefail
+
+DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+POD_ID=""
+BUCKET=""
+SLUG=""
+DRY_RUN=0
+
+err()  { printf 'folder-materialize: %s\n' "$*" >&2; exit 1; }
+note() { printf 'folder-materialize: %s\n' "$*" >&2; }
+usage() { sed -n '1,10p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bucket)  BUCKET="$2"; shift 2;;
+        --slug)    SLUG="$2"; shift 2;;
+        --droplet) DROPLET="$2"; shift 2;;
+        --dry-run) DRY_RUN=1; shift;;
+        -h|--help) usage; exit 0;;
+        --) shift; break;;
+        -*) err "unknown flag: $1 (try --help)";;
+        *)
+            if [[ -z "$POD_ID" ]]; then POD_ID="$1"; else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+[[ -n "$POD_ID" ]] || err "missing <pod-id>"
+[[ -n "$BUCKET" ]] || err "missing --bucket NAME"
+
+case "$POD_ID" in
+    wannolot-*|tytus-*) POD_NUM="${POD_ID##*-}";;
+    *) POD_NUM="$POD_ID";;
+esac
+CONTAINER="tytus-${POD_NUM}"
+
+if [[ -z "$SLUG" ]]; then
+    SLUG=$(python3 - "$BUCKET" "$HOME/.cache/garagetytus/bisync" <<'PY'
+import json, os, re, sys
+bucket, root = sys.argv[1], sys.argv[2]
+slug = ""
+local = ""
+try:
+    for name in os.listdir(root):
+        if not name.endswith(".bindings.json"):
+            continue
+        data = json.load(open(os.path.join(root, name)))
+        if data.get("bucket") == bucket:
+            slug = data.get("slug") or ""
+            local = data.get("local_path") or ""
+            break
+except Exception:
+    pass
+if not slug:
+    base = os.path.basename(os.path.normpath(local)) if local else bucket
+    slug = re.sub(r"[^a-z0-9-]+", "-", base.lower()).strip("-")
+if not slug or len(slug) > 63:
+    slug = re.sub(r"[^a-z0-9-]+", "-", bucket.lower()).strip("-")[:63]
+print(slug or "shared")
+PY
+)
+fi
+
+if ! [[ "$SLUG" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    err "unsafe slug: ${SLUG}"
+fi
+
+note "target pod=${CONTAINER} bucket=${BUCKET} slug=${SLUG}"
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    note "dry-run — no pod changes"
+    exit 0
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+PYFILE="$TMP/materialize.py"
+cat > "$PYFILE" <<'PY'
+import datetime as dt
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError, EndpointConnectionError
+
+bucket_name = sys.argv[1]
+slug = sys.argv[2]
+home = Path(os.environ.get("TYTUS_HOME") or os.environ.get("HERMES_HOME") or "/app/workspace")
+creds_path = Path(os.environ.get("GARAGETYTUS_CREDENTIALS_PATH") or home / ".garagetytus" / "credentials.json")
+
+SAFE_SKIP = {".garagetytus-bound"}
+
+
+def die(msg):
+    print(f"folder-materialize: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def safe_rel(key: str):
+    key = key.replace("\\", "/").lstrip("/")
+    if not key or key in SAFE_SKIP or key.endswith("/"):
+        return None
+    parts = key.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    if parts[0].startswith(".") and parts[0] not in {".well-known"}:
+        return None
+    return Path(*parts)
+
+try:
+    creds = json.loads(creds_path.read_text())
+except FileNotFoundError:
+    die(f"credentials missing: {creds_path}")
+except json.JSONDecodeError as e:
+    die(f"credentials corrupt: {e}")
+
+buckets = creds.get("buckets") or []
+grant = next((b for b in buckets if b.get("name") == bucket_name), None)
+if not grant:
+    die(f"bucket {bucket_name!r} not granted")
+
+endpoint = grant.get("endpoint")
+access_key = grant.get("access_key")
+secret_key = grant.get("secret_key")
+if not endpoint or not access_key or not secret_key:
+    die("grant is missing endpoint/access_key/secret_key")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint,
+    aws_access_key_id=access_key,
+    aws_secret_access_key=secret_key,
+    region_name=grant.get("region", "garage"),
+    config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3, "mode": "standard"}),
+)
+
+shared_root = home / "shared"
+try:
+    shared_root.mkdir(parents=True, exist_ok=True)
+except FileExistsError:
+    pass
+
+dest = shared_root / slug
+tmp = shared_root / f".tmp-{slug}-{os.getpid()}"
+if tmp.exists():
+    shutil.rmtree(tmp)
+tmp.mkdir(parents=True, exist_ok=True)
+
+objects = []
+try:
+    token = None
+    while True:
+        kwargs = {"Bucket": bucket_name, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        objects.extend(resp.get("Contents", []))
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+except (ClientError, EndpointConnectionError) as e:
+    die(f"list failed: {e}")
+
+pulled = 0
+skipped = 0
+manifest_objects = {}
+root_resolved = tmp.resolve()
+for obj in objects:
+    key = obj.get("Key") or ""
+    rel = safe_rel(key)
+    if rel is None:
+        skipped += 1
+        continue
+    target = (tmp / rel).resolve()
+    if not str(target).startswith(str(root_resolved) + os.sep):
+        skipped += 1
+        continue
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        s3.download_file(bucket_name, key, str(target))
+    except (ClientError, EndpointConnectionError) as e:
+        die(f"download failed for {key}: {e}")
+    manifest_objects[str(rel)] = {
+        "key": key,
+        "size": int(obj.get("Size") or 0),
+        "pulled_at": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+    }
+    pulled += 1
+
+manifest = {
+    "schema_version": 1,
+    "status": "materialized",
+    "bucket": bucket_name,
+    "slug": slug,
+    "sync_layout": grant.get("sync_layout") or "legacy_bucket_root",
+    "folder_id": grant.get("folder_id") or creds.get("folder_id"),
+    "updated_at": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+    "object_count": pulled,
+    "skipped": skipped,
+    "objects": manifest_objects,
+}
+(tmp / ".tytus-shared-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+if dest.exists():
+    shutil.rmtree(dest)
+os.replace(tmp, dest)
+print(json.dumps({"status": "materialized", "bucket": bucket_name, "slug": slug, "workspace_path": str(dest), "object_count": pulled, "skipped": skipped}))
+PY
+
+REMOTE_TMP="/tmp/garagetytus-materialize-${POD_NUM}-$$-$(date +%s).py"
+REMOTE_IN_CONTAINER="/app/workspace/.garagetytus/materialize.py"
+scp -q "$PYFILE" "$DROPLET":"$REMOTE_TMP"
+ssh -o BatchMode=yes "$DROPLET" \
+  "docker exec '${CONTAINER}' mkdir -p /app/workspace/.garagetytus && \
+   docker exec -i '${CONTAINER}' sh -c 'cat > ${REMOTE_IN_CONTAINER}' < '$REMOTE_TMP' && \
+   rm -f '$REMOTE_TMP' && \
+   docker exec '${CONTAINER}' python3 '${REMOTE_IN_CONTAINER}' '$BUCKET' '$SLUG'"
+note "✅ materialized ${BUCKET} in ${CONTAINER}:/app/workspace/shared/${SLUG}"

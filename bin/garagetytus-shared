@@ -7,10 +7,11 @@ The agent calls this instead of typing access keys. Credentials live at
 the default-marked bucket if omitted.
 
 Subcommands:
-    list [--bucket NAME] [--prefix PREFIX]
-    put  <local-file> [--bucket NAME] [--key KEY]
-    get  <key> <local-path> [--bucket NAME]
-    rm   <key> [--bucket NAME] [--yes]
+    status [--json]
+    list [--bucket NAME] [--prefix PREFIX] [--folder SLUG]
+    put  <local-file> [--bucket NAME] [--key KEY] [--folder SLUG]
+    get  <key> <local-path> [--bucket NAME] [--folder SLUG]
+    rm   <key> [--bucket NAME] [--yes] [--folder SLUG]
     buckets
     whoami
 """
@@ -44,6 +45,56 @@ def load_creds():
     if not data.get("buckets"):
         sys.exit("garagetytus-shared: no buckets granted to this pod")
     return data
+
+
+def status_payload():
+    path = os.environ.get("GARAGETYTUS_CREDENTIALS_PATH", DEFAULT_CREDS)
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {"status": "not_provisioned", "credentials_path": path}
+    except json.JSONDecodeError as e:
+        return {"status": "corrupt_credentials", "credentials_path": path, "error": str(e)}
+    buckets = data.get("buckets") or []
+    return {
+        "status": "configured" if buckets else "no_buckets_granted",
+        "credentials_path": path,
+        "pod_id": data.get("pod_id"),
+        "folder_id": data.get("folder_id"),
+        "folder_slug": data.get("folder_slug"),
+        "workspace_path": data.get("workspace_path"),
+        "buckets_granted": len(buckets),
+        "buckets": [
+            {
+                "name": b.get("name"),
+                "default": bool(b.get("default")),
+                "folder_id": b.get("folder_id"),
+                "folder_slug": b.get("folder_slug"),
+                "workspace_path": b.get("workspace_path"),
+                "sync_layout": b.get("sync_layout"),
+                "purpose": b.get("purpose", ""),
+            }
+            for b in buckets
+        ],
+    }
+
+
+def cmd_status(args, _creds):
+    payload = status_payload()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(f"status:           {payload.get('status')}")
+    print(f"credentials_path: {payload.get('credentials_path')}")
+    if payload.get("pod_id"):
+        print(f"pod_id:           {payload.get('pod_id')}")
+    if payload.get("folder_slug"):
+        print(f"folder_slug:      {payload.get('folder_slug')}")
+    if payload.get("workspace_path"):
+        print(f"workspace_path:   {payload.get('workspace_path')}")
+    if payload.get("buckets_granted") is not None:
+        print(f"buckets_granted:  {payload.get('buckets_granted')}")
 
 
 def pick_bucket(creds, name=None):
@@ -167,11 +218,13 @@ def build_parser():
     pl = sub.add_parser("list", help="list bucket contents")
     pl.add_argument("--bucket")
     pl.add_argument("--prefix")
+    pl.add_argument("--folder", help="accepted for compatibility; ignored for legacy bucket-root grants")
     pl.set_defaults(func=cmd_list)
 
     pp = sub.add_parser("put", help="upload a local file")
     pp.add_argument("local_file")
     pp.add_argument("--bucket")
+    pp.add_argument("--folder", help="accepted for compatibility; ignored for legacy bucket-root grants")
     pp.add_argument("--key", help="explicit key (default: from-<pod-id>/<basename>)")
     pp.set_defaults(func=cmd_put)
 
@@ -179,13 +232,19 @@ def build_parser():
     pg.add_argument("key")
     pg.add_argument("local_path")
     pg.add_argument("--bucket")
+    pg.add_argument("--folder", help="accepted for compatibility; ignored for legacy bucket-root grants")
     pg.set_defaults(func=cmd_get)
 
     pr = sub.add_parser("rm", help="delete an object (requires --yes)")
     pr.add_argument("key")
     pr.add_argument("--bucket")
+    pr.add_argument("--folder", help="accepted for compatibility; ignored for legacy bucket-root grants")
     pr.add_argument("--yes", action="store_true")
     pr.set_defaults(func=cmd_rm)
+
+    ps = sub.add_parser("status", help="show provisioning status")
+    ps.add_argument("--json", action="store_true")
+    ps.set_defaults(func=cmd_status)
 
     sub.add_parser("buckets", help="list buckets granted to this pod"
                    ).set_defaults(func=cmd_buckets)

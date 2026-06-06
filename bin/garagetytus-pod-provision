@@ -18,6 +18,7 @@
 #
 # Usage:
 #   garagetytus-pod-provision <pod-id> --bucket NAME [--bucket NAME2 ...]
+#                             [--slug SLUG] [--folder-id FOLDER_ID]
 #                             [--droplet HOST] [--droplet-config PATH]
 #                             [--no-restart] [--dry-run]
 #
@@ -37,6 +38,8 @@ WANNOLOT_NETNS="wannolot-01"
 INTERNAL_ENDPOINT="http://10.42.42.1:3900"
 
 WRAPPER_LOCAL="$(cd "$(dirname "$0")" && pwd)/garagetytus-shared"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MATERIALIZE_SCRIPT="${SCRIPT_DIR}/garagetytus-folder-materialize"
 MARKER="<!-- garagetytus:shared-folders v2 -->"
 TYTUS_CLI_VERSION="v0.5.1"
 
@@ -44,6 +47,8 @@ POD_ID=""
 BUCKETS=()
 NO_RESTART=0
 DRY_RUN=0
+SLUG=""
+FOLDER_ID=""
 
 err()  { printf 'pod-provision: %s\n' "$*" >&2; exit 1; }
 note() { printf 'pod-provision: %s\n' "$*" >&2; }
@@ -52,6 +57,8 @@ usage() { sed -n '1,30p' "$0" | sed 's|^# \{0,1\}||'; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --bucket)         BUCKETS+=("$2"); shift 2;;
+        --slug)           SLUG="$2"; shift 2;;
+        --folder-id)      FOLDER_ID="$2"; shift 2;;
         --droplet)        DROPLET="$2"; shift 2;;
         --droplet-config) DROPLET_CONFIG="$2"; shift 2;;
         --no-restart)     NO_RESTART=1; shift;;
@@ -77,6 +84,40 @@ case "$POD_ID" in
 esac
 POD_LABEL="wannolot-${POD_NUM}"
 CONTAINER="tytus-${POD_NUM}"
+
+derive_slug() {
+    local bucket="$1"
+    python3 - "$bucket" "$HOME/.cache/garagetytus/bisync" <<'PY'
+import json, os, re, sys
+bucket, root = sys.argv[1], sys.argv[2]
+slug = ""
+local = ""
+try:
+    for name in os.listdir(root):
+        if not name.endswith(".bindings.json"):
+            continue
+        p = os.path.join(root, name)
+        data = json.load(open(p))
+        if data.get("bucket") == bucket:
+            slug = data.get("slug") or ""
+            local = data.get("local_path") or ""
+            break
+except Exception:
+    pass
+if not slug:
+    base = os.path.basename(os.path.normpath(local)) if local else bucket
+    slug = re.sub(r"[^a-z0-9-]+", "-", base.lower()).strip("-")
+if not slug or len(slug) > 63:
+    slug = re.sub(r"[^a-z0-9-]+", "-", bucket.lower()).strip("-")[:63]
+print(slug or "shared")
+PY
+}
+
+derive_folder_id() {
+    local bucket="$1" slug="$2"
+    if [[ -n "$FOLDER_ID" ]]; then printf '%s\n' "$FOLDER_ID"; return; fi
+    printf 'sf_%s\n' "$(printf '%s' "${bucket}|${slug}" | shasum -a 256 | awk '{print substr($1,1,16)}')"
+}
 
 note "target pod=${CONTAINER} label=${POD_LABEL} buckets=${BUCKETS[*]}"
 
@@ -121,6 +162,8 @@ fi
 note "phase 2/6 — mint per-bucket grants"
 declare -a CRED_BLOBS=()
 for bucket in "${BUCKETS[@]}"; do
+    bucket_slug="${SLUG:-$(derive_slug "$bucket")}"
+    bucket_folder_id="$(derive_folder_id "$bucket" "$bucket_slug")"
     key_name="pod-${POD_NUM}-${bucket}"
     if [[ "$DRY_RUN" -eq 1 ]]; then
         note "  dry: would mint ${key_name} on ${bucket}"
@@ -149,13 +192,19 @@ for bucket in "${BUCKETS[@]}"; do
     CRED_BLOBS+=("$(jq -nc \
         --arg name "$bucket" \
         --arg endpoint "$INTERNAL_ENDPOINT" \
+        --arg folder_id "$bucket_folder_id" \
+        --arg folder_slug "$bucket_slug" \
+        --arg workspace_path "/app/workspace/shared/${bucket_slug}" \
         --arg ak "$ak" --arg sk "$sk" \
         --arg gid "g_${POD_NUM}_${bucket}_$(date -u +%s)" \
         --arg exp "$(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)" \
         '{name:$name, endpoint:$endpoint, region:"garage",
           access_key:$ak, secret_key:$sk, perms:"rw",
+          folder_id:$folder_id, folder_slug:$folder_slug,
+          workspace_path:$workspace_path,
+          sync_layout:"legacy_bucket_root",
           grant_id:$gid, expires_at:$exp,
-          purpose:"general work files", default:false}')")
+          purpose:("shared-folder:" + $folder_id), default:false}')")
 done
 
 # Mark first bucket as default
@@ -172,7 +221,9 @@ creds_json=$(jq -n \
     --arg pod "$POD_LABEL" \
     --argjson buckets "$buckets_json" \
     '{schema_version:1, provisioned_at:$now, provisioned_by:$by,
-      pod_id:$pod, buckets:$buckets}')
+      pod_id:$pod, buckets:$buckets,
+      folder_id:($buckets[0].folder_id), folder_slug:($buckets[0].folder_slug),
+      workspace_path:($buckets[0].workspace_path)}')
 
 audit_json=$(jq -n \
     --arg now "$now_iso" \
@@ -205,7 +256,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     run_droplet "mkdir -p ${DROP_TMP}"
     scp -q "$TMP/credentials.json" "$TMP/_last-provision.json" \
         "$TMP/garagetytus-shared" "$DROPLET":"${DROP_TMP}/"
-    run_pod "mkdir -p /app/workspace/.garagetytus"
+    run_pod "mkdir -p /app/workspace/.garagetytus /app/workspace/shared /app/workspace/.tytus/bin"
     run_droplet "docker cp ${DROP_TMP}/garagetytus-shared ${CONTAINER}:/app/workspace/.garagetytus/garagetytus-shared && \
                  docker cp ${DROP_TMP}/credentials.json ${CONTAINER}:/app/workspace/.garagetytus/credentials.json && \
                  docker cp ${DROP_TMP}/_last-provision.json ${CONTAINER}:/app/workspace/.garagetytus/_last-provision.json"
@@ -331,6 +382,19 @@ note "phase 6/6 — smoke-test garagetytus-shared"
 if [[ "$DRY_RUN" -eq 0 ]]; then
     run_pod "python3 /app/workspace/.garagetytus/garagetytus-shared whoami" >&2
     run_pod "python3 /app/workspace/.garagetytus/garagetytus-shared buckets" >&2
+fi
+
+# ── 7. materialize selected folders into /app/workspace/shared/<slug> ─
+note "phase 7/7 — materialize shared folders into pod workspace"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    if [[ -x "$MATERIALIZE_SCRIPT" ]]; then
+        for bucket in "${BUCKETS[@]}"; do
+            bucket_slug="${SLUG:-$(derive_slug "$bucket")}"
+            "$MATERIALIZE_SCRIPT" "$POD_NUM" --bucket "$bucket" --slug "$bucket_slug" --droplet "$DROPLET" >&2
+        done
+    else
+        note "  materializer missing at ${MATERIALIZE_SCRIPT}; credentials provisioned but files not materialized"
+    fi
 fi
 
 note "✅ provisioned ${POD_LABEL} for buckets: ${BUCKETS[*]}"
