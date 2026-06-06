@@ -173,14 +173,19 @@ for bucket in "${BUCKETS[@]}"; do
         # If the key already exists, `key info` returns the existing one
         # but redacts the secret. So: try to reuse an existing key by
         # name (preferred — keeps long-lived grants stable), else create.
-        existing_id=$(run_garage "key list" 2>/dev/null \
-            | awk -v n="$key_name" '$3==n {print $1; exit}')
-        if [[ -n "$existing_id" ]]; then
-            note "  reusing existing key ${key_name} (id=${existing_id})"
+        mapfile -t existing_ids < <(run_garage "key list" 2>/dev/null \
+            | awk -v n="$key_name" '$3==n {print $1}')
+        if [[ "${#existing_ids[@]}" -gt 0 ]]; then
+            note "  rotating ${#existing_ids[@]} existing key(s) for ${key_name}: ${existing_ids[*]}"
             # Garage redacts secret on `key info`. We need the secret to
-            # populate credentials.json. Rotate: delete + recreate.
-            run_garage "key delete --yes ${existing_id}" >/dev/null
-            existing_id=""
+            # populate credentials.json. Rotate: delete + recreate. Delete
+            # every duplicate key name and tolerate stale IDs: concurrent
+            # provisioning jobs may already have deleted one of them.
+            for existing_id in "${existing_ids[@]}"; do
+                if ! run_garage "key delete --yes ${existing_id}" >/dev/null 2>&1; then
+                    note "  stale key ${existing_id} already absent; continuing"
+                fi
+            done
         fi
         create_out=$(run_garage "key create ${key_name}")
         ak=$(printf '%s\n' "$create_out" | awk -F': *' '/^Key ID/{print $2; exit}')
@@ -269,7 +274,10 @@ fi
 # ── 4. build the systemPromptOverride append ──────────────────────
 note "phase 4/6 — append shared-folder fragment to systemPromptOverride"
 buckets_md=$(printf '%s\n' "${CRED_BLOBS[@]}" \
-    | jq -r '. | "  - \(.name) (rw): \(.purpose)"')
+    | jq -r '. | "  - \(.name) (rw): \(.purpose) — mounted at \(.workspace_path)"')
+
+mounts_md=$(printf '%s\n' "${CRED_BLOBS[@]}" \
+    | jq -r '. | "  - \(.name): /app/workspace/Shared/\(.folder_slug)/  (same folder as \(.workspace_path)/)"')
 
 fragment=$(cat <<EOF
 
@@ -288,6 +296,16 @@ Your pod identity (used in file prefixes): ${POD_LABEL}
 
 Available buckets:
 ${buckets_md}
+
+MOUNTED FILESYSTEM PATHS — read these before saying a folder is missing:
+${mounts_md}
+
+The materialized shared folders are real directories under /app/workspace/Shared/<slug>/
+(and also reachable through the lowercase symlink /app/workspace/shared/<slug>/).
+For the marketing bucket, check /app/workspace/Shared/marketing/ first.
+Do NOT only check /app/workspace/Projects or an empty parent directory.
+Before answering "no shared folder" or "no marketing folder", run:
+  find /app/workspace/Shared -maxdepth 3 -type d -print | head -80
 
 NAMING CONVENTION inside any bucket:
   - Files YOU produce: prefix the key with from-${POD_LABEL}/
