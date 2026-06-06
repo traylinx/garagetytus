@@ -113,6 +113,74 @@ note "target local=${LOCAL_PATH} bucket=${BUCKET}"
 [[ "$AUTO_SYNC" -eq 1 ]] && note "auto-sync ON (interval=${INTERVAL}s, timeout=${TIMEOUT_SEC}s)"
 [[ "$DRY_RUN"   -eq 1 ]] && note "DRY-RUN — no remote/local changes"
 
+canonical_local_path() {
+    python3 - "$1" <<'PY'
+import os, sys
+p = os.path.abspath(os.path.expanduser(sys.argv[1]))
+real = os.path.realpath(p)
+if real != os.sep:
+    real = real.rstrip(os.sep)
+print(os.path.normcase(real))
+PY
+}
+
+path_relation() {
+    python3 - "$1" "$2" <<'PY'
+import os, sys
+a = os.path.normcase(os.path.realpath(os.path.abspath(sys.argv[1]))).rstrip(os.sep) or os.sep
+b = os.path.normcase(os.path.realpath(os.path.abspath(sys.argv[2]))).rstrip(os.sep) or os.sep
+if a == b:
+    print("same")
+elif os.path.commonpath([a, b]) == a:
+    print("a_contains_b")
+elif os.path.commonpath([a, b]) == b:
+    print("b_contains_a")
+else:
+    print("none")
+PY
+}
+
+check_existing_binding_conflicts() {
+    [[ "$DRY_RUN" -eq 0 ]] || return 0
+    mkdir -p "$WORKDIR_BASE"
+    local requested_real
+    requested_real="$(canonical_local_path "$LOCAL_PATH")"
+
+    shopt -s nullglob
+    local sidecars=("${WORKDIR_BASE}"/*.bindings.json)
+    shopt -u nullglob
+    for sidecar in "${sidecars[@]}"; do
+        local existing_bucket existing_local existing_real rel
+        existing_bucket="$(jq -r '.bucket // empty' "$sidecar" 2>/dev/null || true)"
+        existing_local="$(jq -r '.local_path // empty' "$sidecar" 2>/dev/null || true)"
+        [[ -n "$existing_bucket" && -n "$existing_local" ]] || continue
+
+        existing_real="$(canonical_local_path "$existing_local")"
+
+        if [[ "$existing_bucket" == "$BUCKET" && "$existing_real" == "$requested_real" ]]; then
+            err "bucket '${BUCKET}' is already bound to ${existing_local}; open that folder's settings instead of creating it again"
+        fi
+        if [[ "$existing_bucket" == "$BUCKET" ]]; then
+            err "bucket '${BUCKET}' is already bound to ${existing_local}; choose a new bucket name or unbind the existing folder first"
+        fi
+
+        rel="$(path_relation "$LOCAL_PATH" "$existing_local")"
+        case "$rel" in
+            same)
+                err "local folder ${LOCAL_PATH} is already bound to bucket '${existing_bucket}'; choose a different folder or unbind the existing binding first"
+                ;;
+            a_contains_b)
+                err "local folder ${LOCAL_PATH} contains existing binding ${existing_local} (bucket '${existing_bucket}'); shared folders cannot be nested"
+                ;;
+            b_contains_a)
+                err "local folder ${LOCAL_PATH} is inside existing binding ${existing_local} (bucket '${existing_bucket}'); shared folders cannot be nested"
+                ;;
+        esac
+    done
+}
+
+check_existing_binding_conflicts
+
 run_droplet() {
     if [[ "$DRY_RUN" -eq 1 ]]; then
         printf 'DRY: ssh %s %s\n' "$DROPLET" "$*" >&2; return 0
@@ -243,7 +311,7 @@ Do not delete this marker — bisync uses it to track folder identity.
 MEOF
 fi
 if [[ "$DRY_RUN" -eq 0 ]]; then
-    rclone --config "$RCLONE_CONF" \
+    /usr/local/bin/timeout "$TIMEOUT_SEC" rclone --config "$RCLONE_CONF" \
         bisync "$LOCAL_PATH" "${RCLONE_REMOTE}:${BUCKET}" \
         --workdir "$WORKDIR" \
         --create-empty-src-dirs \
