@@ -17,7 +17,13 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # Transitive via keyring -> secret-service -> zbus. No direct garagetytus API
+    # surface; tracked for dependency refresh outside the shared-folder hotfix.
+    "RUSTSEC-2024-0388", # derivative unmaintained
+    # Transitive via keyring async stack. No safe upgrade path in current tree.
+    "RUSTSEC-2024-0384", # instant unmaintained
+]
 
 [licenses]
 version = 2

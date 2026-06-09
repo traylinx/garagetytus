@@ -170,8 +170,13 @@ impl AuditLog {
     /// Unconditional rotation. Used when operators hit a size ceiling
     /// or by tests.
     pub fn force_rotate(&self) -> Result<(), RotationError> {
-        let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
-        let archive = self.path.with_extension(format!("jsonl.{ts}"));
+        let ts = Utc::now().format("%Y%m%dT%H%M%S%.9fZ").to_string();
+        let mut archive = self.path.with_extension(format!("jsonl.{ts}"));
+        let mut suffix = 1u32;
+        while archive.exists() {
+            archive = self.path.with_extension(format!("jsonl.{ts}.{suffix}"));
+            suffix += 1;
+        }
         debug!(
             "rotating audit log {} → {}",
             self.path.display(),
