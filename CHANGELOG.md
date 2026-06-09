@@ -5,6 +5,19 @@ All notable changes to garagetytus.
 The format is based on [Keep a Changelog](https://keepachangelog.com/);
 versions follow [SemVer](https://semver.org/).
 
+## [Unreleased — Tytus shared-folder production hotfix] — 2026-06-09
+
+### Fixed
+
+- Tytus shared-folder helpers are now compatible with macOS `/bin/bash` 3.2 by removing Bash-4-only array readers. This fixes `garagetytus-refresh-watchdog: mapfile: command not found` from TytusOS after reboot.
+- `garagetytus-pod-provision`, `garagetytus-pod-refresh`, and `garagetytus-pod-deprovision` now accept Tytus route selectors and resolve them to the correct DAM-local pod id and droplet before touching Docker. This fixes route-aware sharing in multi-droplet Strato fleets where every droplet can have its own `tytus-01`.
+- Pod command execution now uses base64-piped scripts instead of fragile nested single-quote `sh -c` strings, preventing launchd/Bash 3.2 quoting failures during prompt overlay writes.
+
+### Added
+
+- CI shell contracts for Tytus helper scripts: Bash syntax checks, Bash-4 feature guard, and route-selector dry-run coverage for provision/refresh/deprovision.
+- Watchdog test isolation around the process-global unclean-shutdown counter to remove a parallel-test flake in CI.
+
 ## [Unreleased — v0.5 multinode scaffolding] — 2026-04-25
 
 > Scaffolding for the v0.5 multinode sprint

@@ -40,8 +40,12 @@ done
 
 note "watchdog tick at $(date -u +%Y-%m-%dT%H:%M:%SZ); threshold=${THRESHOLD_DAYS}d"
 
-# Walk running tytus-NN containers
-mapfile -t containers < <(ssh -o BatchMode=yes "$DROPLET" \
+# Walk running tytus-NN containers. Use a read loop instead of Bash-4-only array readers:
+# macOS still ships bash 3.2, and TytusOS invokes this helper on the Mac.
+containers=()
+while IFS= read -r container; do
+    [[ -n "$container" ]] && containers+=("$container")
+done < <(ssh -o BatchMode=yes "$DROPLET" \
     'docker ps --filter name=tytus- --format "{{.Names}}"' 2>/dev/null)
 
 if [[ "${#containers[@]}" -eq 0 ]]; then

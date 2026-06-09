@@ -31,6 +31,9 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --all-targets
 
+      - name: Tytus helper shell contracts
+        run: /bin/bash tests/helper_contracts.sh
+
       - name: LD#1 contract — no garage-* crate dep
         run: cargo test --package garagetytus --test contract_no_garage_crates
 

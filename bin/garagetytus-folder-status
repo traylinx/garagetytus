@@ -189,7 +189,10 @@ probe_one() {
     local sidecar="${WORKDIR_BASE}/${safe_name}.bindings.json"
     if [[ -f "$sidecar" ]]; then
         local expected_pods
-        mapfile -t expected_pods < <(jq -r '.pods_provisioned[]?' "$sidecar")
+        expected_pods=()
+        while IFS= read -r expected_pod; do
+            [[ -n "$expected_pod" ]] && expected_pods+=("$expected_pod")
+        done < <(jq -r '.pods_provisioned[]?' "$sidecar")
         if [[ "${#expected_pods[@]}" -eq 0 ]]; then
             checks+=("pods=expected|ok|none expected (bound without --to)")
         else

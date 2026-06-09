@@ -95,9 +95,8 @@ pub fn tick(
     prev_mode: Mode,
     started_at: DateTime<Utc>,
 ) -> Result<WatchdogState> {
-    std::fs::create_dir_all(state_dir).with_context(|| {
-        format!("create state dir {}", state_dir.display())
-    })?;
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create state dir {}", state_dir.display()))?;
 
     let disk_free_pct = read_disk_free_pct(data_dir).unwrap_or(0.0);
     let mode = next_mode(prev_mode, disk_free_pct);
@@ -203,9 +202,8 @@ fn integrity_check_step(state_dir: &Path) -> Result<()> {
             }
         }
     }
-    std::fs::write(&sentinel, our_pid.to_string()).with_context(|| {
-        format!("write sentinel {}", sentinel.display())
-    })?;
+    std::fs::write(&sentinel, our_pid.to_string())
+        .with_context(|| format!("write sentinel {}", sentinel.display()))?;
     Ok(())
 }
 
@@ -237,16 +235,9 @@ pub fn write_watchdog_json(state_dir: &Path, state: &WatchdogState) -> Result<()
     let final_path = state_dir.join("watchdog.json");
     let tmp_path = state_dir.join("watchdog.json.tmp");
     let bytes = serde_json::to_vec_pretty(state)?;
-    std::fs::write(&tmp_path, &bytes).with_context(|| {
-        format!("write {}", tmp_path.display())
-    })?;
-    std::fs::rename(&tmp_path, &final_path).with_context(|| {
-        format!(
-            "rename {} -> {}",
-            tmp_path.display(),
-            final_path.display()
-        )
-    })?;
+    std::fs::write(&tmp_path, &bytes).with_context(|| format!("write {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &final_path)
+        .with_context(|| format!("rename {} -> {}", tmp_path.display(), final_path.display()))?;
     Ok(())
 }
 
@@ -312,8 +303,7 @@ pub fn read_watchdog_json(state_dir: &Path) -> Result<Option<WatchdogState>> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     let state: WatchdogState = serde_json::from_slice(&bytes)?;
     Ok(Some(state))
 }
@@ -321,7 +311,13 @@ pub fn read_watchdog_json(state_dir: &Path) -> Result<Option<WatchdogState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    fn unclean_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn next_mode_hysteresis() {
@@ -446,6 +442,7 @@ mod tests {
 
     #[test]
     fn tick_writes_state_file() {
+        let _guard = unclean_counter_test_lock();
         let tmp = tempdir().unwrap();
         let started = Utc::now();
         let state = tick(tmp.path(), tmp.path(), Mode::Rw, started).unwrap();
@@ -456,6 +453,7 @@ mod tests {
 
     #[test]
     fn integrity_check_step_creates_sentinel() {
+        let _guard = unclean_counter_test_lock();
         let tmp = tempdir().unwrap();
         integrity_check_step(tmp.path()).unwrap();
         let sentinel = tmp.path().join("sentinel.lock");
@@ -482,6 +480,7 @@ mod tests {
 
     #[test]
     fn preflight_unclean_check_clean_first_run() {
+        let _guard = unclean_counter_test_lock();
         // No sentinel, no counter file → returns Ok(false), counter stays 0.
         let tmp = tempdir().unwrap();
         UNCLEAN_SHUTDOWN_TOTAL.store(0, Ordering::Relaxed);
@@ -492,6 +491,7 @@ mod tests {
 
     #[test]
     fn preflight_unclean_check_detects_orphan_pid() {
+        let _guard = unclean_counter_test_lock();
         let tmp = tempdir().unwrap();
         // Seed an orphan-PID sentinel — pick a PID that's almost
         // certainly not alive (max u32 minus 1; kernel won't have
@@ -502,14 +502,14 @@ mod tests {
         let unclean = preflight_unclean_check(tmp.path()).unwrap();
         assert!(unclean);
         // Counter file should now exist with value 1.
-        let body = std::fs::read_to_string(tmp.path().join("unclean_shutdown_total.txt"))
-            .unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("unclean_shutdown_total.txt")).unwrap();
         assert_eq!(body.trim(), "1");
         assert_eq!(UNCLEAN_SHUTDOWN_TOTAL.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn preflight_unclean_check_persisted_counter_is_loaded() {
+        let _guard = unclean_counter_test_lock();
         // Even on a clean run, the persisted counter from a
         // previous unclean shutdown must populate the in-memory
         // atomic.
@@ -523,6 +523,7 @@ mod tests {
 
     #[test]
     fn preflight_unclean_check_skips_when_sentinel_pid_alive() {
+        let _guard = unclean_counter_test_lock();
         // Sentinel with our own PID — process is alive, no
         // unclean-shutdown signal.
         let tmp = tempdir().unwrap();
@@ -534,11 +535,11 @@ mod tests {
         UNCLEAN_SHUTDOWN_TOTAL.store(0, Ordering::Relaxed);
         let unclean = preflight_unclean_check(tmp.path()).unwrap();
         assert!(!unclean);
-        assert!(!tmp.path().join("unclean_shutdown_total.txt").exists()
-            || std::fs::read_to_string(
-                tmp.path().join("unclean_shutdown_total.txt"),
-            )
-            .map(|s| s.trim() == "0")
-            .unwrap_or(true));
+        assert!(
+            !tmp.path().join("unclean_shutdown_total.txt").exists()
+                || std::fs::read_to_string(tmp.path().join("unclean_shutdown_total.txt"),)
+                    .map(|s| s.trim() == "0")
+                    .unwrap_or(true)
+        );
     }
 }

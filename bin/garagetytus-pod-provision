@@ -33,6 +33,7 @@
 set -euo pipefail
 
 DROPLET="${GARAGETYTUS_DROPLET:-root@212.227.205.146}"
+DROPLET_EXPLICIT=0
 DROPLET_CONFIG="/var/lib/garagetytus/config/garagetytus.toml"
 WANNOLOT_NETNS="wannolot-01"
 INTERNAL_ENDPOINT="http://10.42.42.1:3900"
@@ -59,7 +60,7 @@ while [[ $# -gt 0 ]]; do
         --bucket)         BUCKETS+=("$2"); shift 2;;
         --slug)           SLUG="$2"; shift 2;;
         --folder-id)      FOLDER_ID="$2"; shift 2;;
-        --droplet)        DROPLET="$2"; shift 2;;
+        --droplet)        DROPLET="$2"; DROPLET_EXPLICIT=1; shift 2;;
         --droplet-config) DROPLET_CONFIG="$2"; shift 2;;
         --no-restart)     NO_RESTART=1; shift;;
         --dry-run)        DRY_RUN=1; shift;;
@@ -77,11 +78,96 @@ done
 [[ "${#BUCKETS[@]}" -gt 0 ]] || err "need at least one --bucket NAME"
 [[ -f "$WRAPPER_LOCAL" ]] || err "wrapper not found at $WRAPPER_LOCAL"
 
-# Normalize pod-id: accept "02", "wannolot-02", or "tytus-02".
+resolve_route_selector() {
+    # Modern Tytus fleets expose opaque route ids (e.g. 0e0ah755r3)
+    # because DAM-local pod numbers are only unique per droplet. The Docker
+    # container is still named tytus-01 / tytus-02 on the target droplet.
+    # Resolve route_id -> pod_id (+ droplet_ip when known) from local Tytus
+    # state before touching Docker.
+    local selector="$1"
+    local state_path="${TYTUS_STATE_PATH:-}"
+    if [[ -z "$state_path" ]]; then
+        state_path="${HOME}/Library/Application Support/tytus/state.json"
+    fi
+    [[ -f "$state_path" ]] || return 1
+    python3 - "$state_path" "$selector" <<'PY'
+import json, os, re, sys, urllib.parse, urllib.request
+path, selector = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except Exception:
+    sys.exit(1)
+selector_l = selector.lower()
+
+def droplet_ip_from_provider_config(pod_id, route_id):
+    secret = data.get("secret_key") or ""
+    agent_user = data.get("agent_user_id") or ""
+    if not (secret and agent_user and pod_id and route_id):
+        return ""
+    base = (
+        os.environ.get("TYTUS_PROVIDER_URL")
+        or os.environ.get("TYTUS_API_BASE_URL")
+        or data.get("api_base_url")
+        or "https://tytus.traylinx.com"
+    ).rstrip("/")
+    qs = urllib.parse.urlencode({"pod_id": str(pod_id).zfill(2), "route_id": route_id})
+    req = urllib.request.Request(
+        f"{base}/pod/config/download?{qs}",
+        headers={"X-Agent-Secret-Token": secret, "X-Agent-User-Id": agent_user},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    m = re.search(r"(?im)^\\s*Endpoint\\s*=\\s*([^:\\s]+):\\d+", text)
+    return m.group(1) if m else ""
+
+for key in ("pods", "agents", "included"):
+    rows = data.get(key) or []
+    if not isinstance(rows, list):
+        continue
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        candidates = [
+            row.get("route_id"),
+            row.get("id"),
+        ]
+        if any(str(v).lower() == selector_l for v in candidates if v):
+            raw_pod_id = row.get("pod_id")
+            if raw_pod_id is None or str(raw_pod_id).strip() == "":
+                sys.exit(1)
+            pod_id = str(raw_pod_id).zfill(2)
+            droplet_ip = row.get("droplet_ip") or ""
+            if not droplet_ip:
+                route_id = row.get("route_id") or row.get("id") or selector
+                droplet_ip = droplet_ip_from_provider_config(pod_id, str(route_id))
+            print(f"{pod_id}\t{droplet_ip}")
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# Normalize selector: accept "02", "wannolot-02", "tytus-02", or a Tytus
+# route id. Route ids must resolve to the real runtime pod number.
+ORIGINAL_POD_ID="$POD_ID"
 case "$POD_ID" in
     wannolot-*|tytus-*) POD_NUM="${POD_ID##*-}";;
     *) POD_NUM="$POD_ID";;
 esac
+if [[ ! "$POD_NUM" =~ ^[0-9]+$ ]]; then
+    resolved="$(resolve_route_selector "$POD_NUM" || true)"
+    if [[ -z "$resolved" ]]; then
+        err "pod selector ${ORIGINAL_POD_ID} is not numeric and was not found in local Tytus state"
+    fi
+    POD_NUM="${resolved%%$'\t'*}"
+    resolved_ip="${resolved#*$'\t'}"
+    if [[ "$DROPLET_EXPLICIT" -eq 0 && -n "$resolved_ip" && "$resolved_ip" != "$resolved" ]]; then
+        DROPLET="root@${resolved_ip}"
+    fi
+    note "resolved route selector ${ORIGINAL_POD_ID} -> pod ${POD_NUM} on ${DROPLET}"
+fi
 POD_LABEL="wannolot-${POD_NUM}"
 CONTAINER="tytus-${POD_NUM}"
 
@@ -140,14 +226,15 @@ run_garage() {
 }
 
 run_pod() {
-    # Run a command inside the tytus-NN container. Wraps in `sh -c '...'`
-    # so any `&&` / `;` chains in the caller execute INSIDE the container,
-    # not on the droplet host shell (which would silently mask failures
-    # on commands targeting pod-only paths).
+    # Run a command inside the tytus-NN container. Pipe a base64-encoded
+    # script into `sh` instead of building `sh -c '...'`: TytusOS is launched
+    # by macOS launchd with /bin/bash 3.2, whose single-quote replacement
+    # semantics differ enough to corrupt commands containing jq's `'...'`
+    # filters. Base64 keeps local bash, ssh, and remote sh out of quoting hell.
     local cmd="$*"
-    # Escape single quotes inside cmd: ' → '\''
-    cmd="${cmd//\'/\'\\\'\'}"
-    run_droplet "docker exec ${CONTAINER} sh -c '${cmd}'"
+    local encoded
+    encoded=$(printf '%s' "$cmd" | base64 | tr -d '\n')
+    run_droplet "printf '%s' '${encoded}' | base64 -d | docker exec -i ${CONTAINER} sh"
 }
 
 # ── 1. sanity-check droplet + pod liveness ────────────────────────
@@ -173,7 +260,10 @@ for bucket in "${BUCKETS[@]}"; do
         # If the key already exists, `key info` returns the existing one
         # but redacts the secret. So: try to reuse an existing key by
         # name (preferred — keeps long-lived grants stable), else create.
-        mapfile -t existing_ids < <(run_garage "key list" 2>/dev/null \
+        existing_ids=()
+        while IFS= read -r existing_id; do
+            [[ -n "$existing_id" ]] && existing_ids+=("$existing_id")
+        done < <(run_garage "key list" 2>/dev/null \
             | awk -v n="$key_name" '$3==n {print $1}')
         if [[ "${#existing_ids[@]}" -gt 0 ]]; then
             note "  rotating ${#existing_ids[@]} existing key(s) for ${key_name}: ${existing_ids[*]}"
@@ -279,7 +369,8 @@ buckets_md=$(printf '%s\n' "${CRED_BLOBS[@]}" \
 mounts_md=$(printf '%s\n' "${CRED_BLOBS[@]}" \
     | jq -r '. | "  - \(.name): /app/workspace/Shared/\(.folder_slug)/  (same folder as \(.workspace_path)/)"')
 
-fragment=$(cat <<EOF
+FRAGMENT_FILE="$TMP/shared-fragment.md"
+cat > "$FRAGMENT_FILE" <<EOF
 
 ${MARKER}
 ## Shared folders
@@ -346,7 +437,7 @@ HOW TO TELL IF GARAGE IS HEALTHY (read this before reporting an outage):
 If \`garagetytus-shared\` returns "endpoint unreachable" or
 "credentials expired", tell Sebastian — don't loop on retries.
 EOF
-)
+fragment="$(cat "$FRAGMENT_FILE")"
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     # Read base prompt + current overlay from pod
