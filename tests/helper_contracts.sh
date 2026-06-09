@@ -39,6 +39,14 @@ if grep -R --line-number --fixed-strings 'mapfile' "$ROOT/bin/garagetytus-refres
   exit 1
 fi
 
+# Initial folder bind resync must have a much longer timeout than normal poll
+# runs. A short timeout can kill `rclone bisync --resync` mid-baseline and poison
+# all future folder syncs.
+grep -F 'TIMEOUT_SEC=300' "$ROOT/bin/garagetytus-folder-bind" >/dev/null
+grep -F 'RESYNC_TIMEOUT_SEC=1800' "$ROOT/bin/garagetytus-folder-bind" >/dev/null
+grep -F '/usr/local/bin/timeout "$RESYNC_TIMEOUT_SEC" rclone' "$ROOT/bin/garagetytus-folder-bind" >/dev/null
+grep -F '/usr/local/bin/timeout ${TIMEOUT_SEC} /usr/local/bin/rclone' "$ROOT/bin/garagetytus-folder-bind" >/dev/null
+
 TYTUS_STATE_PATH="$STATE_FILE" /bin/bash "$ROOT/bin/garagetytus-pod-provision" 0e0ah755r3 --bucket missions --dry-run 2>&1 \
   | grep -F 'resolved route selector 0e0ah755r3 -> pod 01 on root@203.0.113.10'
 

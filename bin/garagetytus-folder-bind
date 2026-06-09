@@ -38,7 +38,10 @@ BUCKET=""
 PODS=()
 AUTO_SYNC=0
 INTERVAL=60
-TIMEOUT_SEC=45
+TIMEOUT_SEC=300
+# Initial --resync must never be killed mid-listing: a partial resync leaves an
+# inconsistent bisync baseline. Keep this separate from poll timeout.
+RESYNC_TIMEOUT_SEC=1800
 NO_POD_RESTART=0
 DRY_RUN=0
 
@@ -311,7 +314,7 @@ Do not delete this marker — bisync uses it to track folder identity.
 MEOF
 fi
 if [[ "$DRY_RUN" -eq 0 ]]; then
-    /usr/local/bin/timeout "$TIMEOUT_SEC" rclone --config "$RCLONE_CONF" \
+    /usr/local/bin/timeout "$RESYNC_TIMEOUT_SEC" rclone --config "$RCLONE_CONF" \
         bisync "$LOCAL_PATH" "${RCLONE_REMOTE}:${BUCKET}" \
         --workdir "$WORKDIR" \
         --create-empty-src-dirs \
