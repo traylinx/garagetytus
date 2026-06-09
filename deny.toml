@@ -51,7 +51,9 @@ allow = [
 confidence-threshold = 0.93
 
 [bans]
-multiple-versions = "warn"
+# Duplicate transitive versions are noisy in the keyring/zbus tree and do not
+# affect LD#1. The explicit garage-* deny list below remains hard-fail.
+multiple-versions = "allow"
 wildcards = "deny"
 deny = [
     # LD#1 — explicit garage-* ban. The
