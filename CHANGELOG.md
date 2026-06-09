@@ -16,7 +16,7 @@ versions follow [SemVer](https://semver.org/).
 ### Added
 
 - CI shell contracts for Tytus helper scripts: Bash syntax checks, Bash-4 feature guard, and route-selector dry-run coverage for provision/refresh/deprovision.
-- CI hardening: allow `webpki-roots` permissive `CDLA-Permissive-2.0` data license, document temporary transitive RustSec ignores for `keyring`, serialize `GARAGETYTUS_HOME` env-mutating tests, tolerate missing Secret Service in headless Linux tests, and prevent high-frequency audit-rotation archive collisions, and keep cargo-deny focused on hard LD#1 bans instead of noisy duplicate-version warnings.
+- CI hardening: allow `webpki-roots` permissive `CDLA-Permissive-2.0` data license, document temporary transitive RustSec ignores for `keyring`, serialize `GARAGETYTUS_HOME` env-mutating tests, tolerate missing Secret Service in headless Linux tests, and prevent high-frequency audit-rotation archive collisions, and keep cargo-deny focused on hard LD#1 bans instead of noisy duplicate-version/workspace-path warnings.
 - Watchdog test isolation around the process-global unclean-shutdown counter to remove a parallel-test flake in CI.
 
 ## [Unreleased — v0.5 multinode scaffolding] — 2026-04-25

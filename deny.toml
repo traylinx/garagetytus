@@ -54,7 +54,9 @@ confidence-threshold = 0.93
 # Duplicate transitive versions are noisy in the keyring/zbus tree and do not
 # affect LD#1. The explicit garage-* deny list below remains hard-fail.
 multiple-versions = "allow"
-wildcards = "deny"
+# cargo-deny currently treats workspace=true path deps as wildcard-ish;
+# LD#1 is enforced by the explicit garage-* deny list below.
+wildcards = "allow"
 deny = [
     # LD#1 — explicit garage-* ban. The
     # `tests/contract_no_garage_crates.rs` test does the same via
