@@ -36,6 +36,8 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
+    # Permissive data license used by webpki-roots for Mozilla trust anchors.
+    "CDLA-Permissive-2.0",
 ]
 # AGPL is hard-denied for the Rust dep tree per LD#1. The bundled
 # Garage binary is AGPL but lives at OS-process boundary, not in

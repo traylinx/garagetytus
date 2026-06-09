@@ -20,6 +20,9 @@ use std::path::PathBuf;
 pub const GARAGETYTUS_HOME_ENV: &str = "GARAGETYTUS_HOME";
 const APP_NAME: &str = "garagetytus";
 
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Effective home dir — `GARAGETYTUS_HOME` if set, otherwise the
 /// platform-default data dir. Equivalent to `data_dir()` on a fresh
 /// install.
@@ -83,13 +86,9 @@ pub fn log_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn override_collapses_all_paths_under_one_root() {
-        let _g = LOCK.lock().unwrap();
+        let _g = TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var(GARAGETYTUS_HOME_ENV, "/tmp/garagetytus-test");
         assert_eq!(home_dir(), PathBuf::from("/tmp/garagetytus-test"));
         assert_eq!(data_dir(), PathBuf::from("/tmp/garagetytus-test/data"));
@@ -100,7 +99,7 @@ mod tests {
 
     #[test]
     fn defaults_route_through_dirs_crate() {
-        let _g = LOCK.lock().unwrap();
+        let _g = TEST_ENV_LOCK.lock().unwrap();
         std::env::remove_var(GARAGETYTUS_HOME_ENV);
         let d = data_dir();
         let c = config_dir();
@@ -118,7 +117,7 @@ mod tests {
     fn grants_path_lands_in_config_dir() {
         // LD#9 — grants.json must live under config_dir(),
         // honoring the GARAGETYTUS_HOME override.
-        let _g = LOCK.lock().unwrap();
+        let _g = TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var(GARAGETYTUS_HOME_ENV, "/tmp/garagetytus-grants-test");
         let p = grants_path();
         assert_eq!(

@@ -228,10 +228,6 @@ pub fn parse_config(body: &str) -> Result<ClusterConfig, toml::de::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static LOCK: Mutex<()> = Mutex::new(());
-
     fn fresh_config() -> ClusterConfig {
         ClusterConfig::new(
             "a".repeat(64),
@@ -357,7 +353,7 @@ mod tests {
 
     #[test]
     fn cluster_paths_honor_override() {
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::paths::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var(crate::paths::GARAGETYTUS_HOME_ENV, "/tmp/gtx-cluster-test");
         assert_eq!(
             cluster_config_path(),
