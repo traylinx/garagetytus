@@ -11,6 +11,14 @@
 #                           [--rclone-conf PATH] [--droplet HOST]
 #                           [--no-pod-restart] [--dry-run]
 #
+# Registry mode (Tytus shared folders on AWS S3, files-handsfree A4):
+#   garagetytus folder bind <local-path> <bucket> --registry \
+#                           --prefix <storage-prefix> [--remote tytusaws] \
+#                           [--auto-sync] [--interval N] [--timeout N]
+#   Skips Garage bucket/key minting and pod legs — the registry owns those.
+#   Requires a pre-configured rclone remote (default: tytusaws) backed by a
+#   scoped IAM user limited to the owner's folder prefixes.
+#
 # Example (the headline UX):
 #   garagetytus folder bind ~/Documents/work testbucket --to 02 --auto-sync
 #
@@ -44,10 +52,12 @@ TIMEOUT_SEC=300
 RESYNC_TIMEOUT_SEC=1800
 NO_POD_RESTART=0
 DRY_RUN=0
+REGISTRY=0
+PREFIX=""
 
 err() { printf 'folder-bind: %s\n' "$*" >&2; exit 1; }
 note() { printf 'folder-bind: %s\n' "$*" >&2; }
-usage() { sed -n '1,21p' "$0" | sed 's|^# \{0,1\}||'; }
+usage() { sed -n '1,30p' "$0" | sed 's|^# \{0,1\}||'; }
 
 # Parse `bind` as the first positional if invoked via the
 # `garagetytus folder bind` form (Phase D shape).
@@ -63,6 +73,9 @@ while [[ $# -gt 0 ]]; do
         --rclone-conf)      RCLONE_CONF="$2"; shift 2;;
         --droplet)          DROPLET="$2"; shift 2;;
         --no-pod-restart)   NO_POD_RESTART=1; shift;;
+        --registry)         REGISTRY=1; shift;;
+        --prefix)           PREFIX="$2"; shift 2;;
+        --remote)           RCLONE_REMOTE="$2"; shift 2;;
         --dry-run)          DRY_RUN=1; shift;;
         -h|--help)          usage; exit 0;;
         --) shift; break;;
@@ -77,6 +90,13 @@ done
 
 [[ -n "$LOCAL_PATH" ]] || err "missing <local-path> (try --help)"
 [[ -n "$BUCKET" ]]     || err "missing <bucket> (try --help)"
+if [[ "$REGISTRY" -eq 1 ]]; then
+    [[ -n "$PREFIX" ]] || err "--registry requires --prefix <storage-prefix>"
+    [[ "${#PODS[@]}" -eq 0 ]] || err "--registry binds the Mac leg only; pods get creds from the registry (drop --to)"
+    # prefix sanity: no leading slash, no traversal
+    [[ "$PREFIX" != /* && "$PREFIX" != *..* ]] || err "invalid --prefix '${PREFIX}'"
+    [[ "$RCLONE_REMOTE" == "garagetytus" ]] && RCLONE_REMOTE="tytusaws"
+fi
 
 # Validate bucket name shape (Garage rules: 3-63, lowercase alnum/dot/hyphen,
 # alnum endpoints).
@@ -104,6 +124,14 @@ print(slug or "shared")
 PY
 )
 FOLDER_ID="sf_$(printf '%s' "${BUCKET}|${LOCAL_PATH}" | shasum -a 256 | awk '{print substr($1,1,16)}')"
+if [[ "$REGISTRY" -eq 1 ]]; then
+    REMOTE_PATH="${RCLONE_REMOTE}:${BUCKET}/${PREFIX%/}"
+    # registry-<dir> label: same folder name bound via garage AND registry
+    # must not collide on plist/workdir names.
+    SAFE_NAME=$(printf '%s' "registry-$(basename "$LOCAL_PATH")" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.-]/-/g')
+else
+    REMOTE_PATH="${RCLONE_REMOTE}:${BUCKET}"
+fi
 
 PLIST_LABEL="com.traylinx.garagetytus.bisync.${SAFE_NAME}"
 PLIST_PATH="${PLIST_DIR}/${PLIST_LABEL}.plist"
@@ -219,6 +247,9 @@ ensure_rclone_endpoint() {
     chmod 600 "$RCLONE_CONF"
 }
 
+# Registry mode: the AWS bucket, scoped IAM creds, and pod provisioning
+# are owned by the Tytus registry — only the Mac bisync legs apply here.
+if [[ "$REGISTRY" -eq 0 ]]; then
 # ── 1. ensure bucket exists on droplet ─────────────────────────────
 note "phase 1/6 — ensure bucket exists"
 if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -298,6 +329,17 @@ ensure_rclone_endpoint
 note "phase 3/6 — bucket-allow confirmed for ${BUCKET}"
 
 # ── 4. mkdir local path + initial bisync --resync ─────────────────
+else
+    note "phase 1-3/6 — skipped (--registry: bucket/keys owned by the registry)"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        # List the folder PREFIX, not the bucket root: the scoped IAM user is
+        # prefix-conditioned and bucket-root listing is (correctly) denied.
+        rclone --config "$RCLONE_CONF" lsf "${REMOTE_PATH}/" --max-depth 1 >/dev/null 2>&1 \
+            || err "rclone remote '${RCLONE_REMOTE}' cannot reach ${REMOTE_PATH} — configure it first (scoped IAM user)"
+        note "  remote ${RCLONE_REMOTE} reaches ${REMOTE_PATH} OK"
+    fi
+fi
+
 note "phase 4/6 — mkdir + initial bisync --resync"
 mkdir -p "$LOCAL_PATH" "$WORKDIR"
 # rclone bisync's safety check refuses to sync if the prior path1
@@ -315,13 +357,13 @@ MEOF
 fi
 if [[ "$DRY_RUN" -eq 0 ]]; then
     /usr/local/bin/timeout "$RESYNC_TIMEOUT_SEC" rclone --config "$RCLONE_CONF" \
-        bisync "$LOCAL_PATH" "${RCLONE_REMOTE}:${BUCKET}" \
+        bisync "$LOCAL_PATH" "${REMOTE_PATH}" \
         --workdir "$WORKDIR" \
         --create-empty-src-dirs \
         --resync \
         --max-lock 2m 2>&1 | sed 's/^/    /' || \
         err "initial bisync --resync failed"
-    note "  initial sync complete: ${LOCAL_PATH} ↔ ${RCLONE_REMOTE}:${BUCKET}"
+    note "  initial sync complete: ${LOCAL_PATH} ↔ ${REMOTE_PATH}"
 fi
 
 # ── 5. (optional) launchd plist for polling auto-sync ─────────────
@@ -343,7 +385,7 @@ if [[ "$AUTO_SYNC" -eq 1 ]]; then
     <string>/usr/bin/env</string>
     <string>bash</string>
     <string>-c</string>
-    <string>/usr/local/bin/timeout ${TIMEOUT_SEC} /usr/local/bin/rclone --config "${RCLONE_CONF}" bisync "${LOCAL_PATH}" "${RCLONE_REMOTE}:${BUCKET}" --workdir "${WORKDIR}" --max-lock 2m --create-empty-src-dirs --conflict-resolve newer --resilient</string>
+    <string>/usr/local/bin/timeout ${TIMEOUT_SEC} /usr/local/bin/rclone --config "${RCLONE_CONF}" bisync "${LOCAL_PATH}" "${REMOTE_PATH}" --workdir "${WORKDIR}" --max-lock 2m --create-empty-src-dirs --conflict-resolve newer --resilient</string>
   </array>
   <key>StartInterval</key>
   <integer>${INTERVAL}</integer>
@@ -461,4 +503,4 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         > "$SIDECAR"
 fi
 
-note "✅ folder-bind complete: ${LOCAL_PATH} ↔ ${RCLONE_REMOTE}:${BUCKET}"
+note "✅ folder-bind complete: ${LOCAL_PATH} ↔ ${REMOTE_PATH}"
