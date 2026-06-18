@@ -476,6 +476,26 @@ if root.exists():
                 print(f'quarantined stale shared folder {child.name} -> {target.name}', flush=True)
             else:
                 print(f'left non-selected non-empty folder without manifest: {child.name}', flush=True)
+native_root = Path('/app/workspace/.tytus/shared-folders')
+if native_root.exists():
+    stale_dir = native_root / '.stale'
+    for cfg in sorted(native_root.glob('*.json'), key=lambda p: p.name):
+        try:
+            data = json.load(open(cfg))
+        except Exception:
+            continue
+        bucket = data.get('bucket') or ''
+        slug = data.get('folder_slug') or ''
+        if bucket in selected_buckets or slug in selected_slugs:
+            continue
+        stale_dir.mkdir(parents=True, exist_ok=True)
+        target = stale_dir / (cfg.name + '.' + stamp + '.stale')
+        i = 1
+        while target.exists():
+            target = stale_dir / (cfg.name + '.' + stamp + '.' + str(i) + '.stale')
+            i += 1
+        cfg.rename(target)
+        print(f'quarantined stale native shared-folder config {cfg.name} -> {target.relative_to(native_root)}', flush=True)
 PY" >&2
 fi
 
