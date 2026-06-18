@@ -42,7 +42,7 @@ WRAPPER_LOCAL="$(cd "$(dirname "$0")" && pwd)/garagetytus-shared"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MATERIALIZE_SCRIPT="${SCRIPT_DIR}/garagetytus-folder-materialize"
 MARKER="<!-- garagetytus:shared-folders v2 -->"
-TYTUS_CLI_VERSION="v0.5.1"
+TYTUS_CLI_VERSION="${TYTUS_CLI_VERSION:-garagetytus}"
 
 POD_ID=""
 BUCKETS=()
@@ -50,6 +50,10 @@ NO_RESTART=0
 DRY_RUN=0
 SLUG=""
 FOLDER_ID=""
+TYTUS_BIN="${TYTUS_BIN:-tytus}"
+USE_TYTUS_POD_IO=0
+POD_SELECTOR=""
+GRANT_IDENTITY=""
 
 err()  { printf 'pod-provision: %s\n' "$*" >&2; exit 1; }
 note() { printf 'pod-provision: %s\n' "$*" >&2; }
@@ -157,6 +161,9 @@ case "$POD_ID" in
     *) POD_NUM="$POD_ID";;
 esac
 if [[ ! "$POD_NUM" =~ ^[0-9]+$ ]]; then
+    USE_TYTUS_POD_IO=1
+    POD_SELECTOR="$ORIGINAL_POD_ID"
+    GRANT_IDENTITY="$(printf '%s' "$ORIGINAL_POD_ID" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-40)"
     resolved="$(resolve_route_selector "$POD_NUM" || true)"
     if [[ -z "$resolved" ]]; then
         err "pod selector ${ORIGINAL_POD_ID} is not numeric and was not found in local Tytus state"
@@ -166,8 +173,18 @@ if [[ ! "$POD_NUM" =~ ^[0-9]+$ ]]; then
     if [[ "$DROPLET_EXPLICIT" -eq 0 && -n "$resolved_ip" && "$resolved_ip" != "$resolved" ]]; then
         DROPLET="root@${resolved_ip}"
     fi
-    note "resolved route selector ${ORIGINAL_POD_ID} -> pod ${POD_NUM} on ${DROPLET}"
+    if [[ "$DROPLET_EXPLICIT" -eq 0 ]]; then
+        # Route-scoped pods may live on different droplets while sharing the
+        # same numeric container name (tytus-01). The local Tytus exec/push
+        # APIs route by opaque route_id, so use them for pod file writes and
+        # restarts instead of SSHing to a guessed droplet.
+        note "resolved route selector ${ORIGINAL_POD_ID} -> pod ${POD_NUM}; pod I/O via tytus route, Garage via ${DROPLET}"
+    else
+        note "resolved route selector ${ORIGINAL_POD_ID} -> pod ${POD_NUM} on ${DROPLET}"
+    fi
 fi
+POD_SELECTOR="${POD_SELECTOR:-$POD_NUM}"
+GRANT_IDENTITY="${GRANT_IDENTITY:-$POD_NUM}"
 POD_LABEL="wannolot-${POD_NUM}"
 CONTAINER="tytus-${POD_NUM}"
 
@@ -225,7 +242,29 @@ run_garage() {
                  nsenter -t \$WPID -n -- /root/.local/bin/garage -c ${DROPLET_CONFIG} $*"
 }
 
+run_tytus_pod() {
+    local cmd="$*"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf 'DRY: %s --json exec --pod %s --timeout 120 %q\n' "$TYTUS_BIN" "$POD_SELECTOR" "$cmd" >&2
+        return 0
+    fi
+    local raw exit_code stdout stderr
+    raw=$("$TYTUS_BIN" --json exec --pod "$POD_SELECTOR" --timeout 120 "$cmd")
+    exit_code=$(printf '%s' "$raw" | jq -r '.exit_code // 1')
+    stdout=$(printf '%s' "$raw" | jq -r '.stdout // ""')
+    stderr=$(printf '%s' "$raw" | jq -r '.stderr // ""')
+    printf '%s' "$stdout"
+    if [[ "$exit_code" != "0" ]]; then
+        [[ -n "$stderr" ]] && printf '%s\n' "$stderr" >&2
+        return "$exit_code"
+    fi
+}
+
 run_pod() {
+    if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
+        run_tytus_pod "$@"
+        return $?
+    fi
     # Run a command inside the tytus-NN container. Pipe a base64-encoded
     # script into `sh` instead of building `sh -c '...'`: TytusOS is launched
     # by macOS launchd with /bin/bash 3.2, whose single-quote replacement
@@ -237,11 +276,34 @@ run_pod() {
     run_droplet "printf '%s' '${encoded}' | base64 -d | docker exec -i ${CONTAINER} sh"
 }
 
+copy_to_pod() {
+    local local_path="$1" remote_path="$2"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
+            printf 'DRY: %s push --pod %s --to %s --quiet %s\n' "$TYTUS_BIN" "$POD_SELECTOR" "$remote_path" "$local_path" >&2
+        else
+            printf 'DRY: docker cp %s %s:%s\n' "$local_path" "$CONTAINER" "$remote_path" >&2
+        fi
+        return 0
+    fi
+    if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
+        "$TYTUS_BIN" push --pod "$POD_SELECTOR" --to "$remote_path" --quiet "$local_path" --json >/dev/null
+    else
+        local drop_path="/tmp/garagetytus-copy-${POD_NUM}-$$-$(basename "$remote_path")"
+        scp -q "$local_path" "$DROPLET":"$drop_path"
+        run_droplet "docker cp ${drop_path} ${CONTAINER}:${remote_path} && rm -f ${drop_path}"
+    fi
+}
+
 # ── 1. sanity-check droplet + pod liveness ────────────────────────
 note "phase 1/6 — sanity-check droplet + pod"
 if [[ "$DRY_RUN" -eq 0 ]]; then
-    state=$(run_droplet "docker inspect -f '{{.State.Status}}' ${CONTAINER}" 2>/dev/null || true)
-    [[ "$state" == "running" ]] || err "container ${CONTAINER} not running on ${DROPLET} (state=${state:-missing})"
+    if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
+        run_pod "true" >/dev/null || err "pod route ${POD_SELECTOR} is not reachable through tytus exec"
+    else
+        state=$(run_droplet "docker inspect -f '{{.State.Status}}' ${CONTAINER}" 2>/dev/null || true)
+        [[ "$state" == "running" ]] || err "container ${CONTAINER} not running on ${DROPLET} (state=${state:-missing})"
+    fi
     run_garage status >/dev/null || err "garage daemon unreachable on ${DROPLET}"
 fi
 
@@ -251,7 +313,7 @@ declare -a CRED_BLOBS=()
 for bucket in "${BUCKETS[@]}"; do
     bucket_slug="${SLUG:-$(derive_slug "$bucket")}"
     bucket_folder_id="$(derive_folder_id "$bucket" "$bucket_slug")"
-    key_name="pod-${POD_NUM}-${bucket}"
+    key_name="pod-${GRANT_IDENTITY}-${bucket}"
     if [[ "$DRY_RUN" -eq 1 ]]; then
         note "  dry: would mint ${key_name} on ${bucket}"
         ak="GK00000000000000DRYRUNAK"; sk="0000000000000000000000000000000000000000000000000000000000000000DRY"
@@ -289,9 +351,9 @@ for bucket in "${BUCKETS[@]}"; do
         --arg endpoint "$INTERNAL_ENDPOINT" \
         --arg folder_id "$bucket_folder_id" \
         --arg folder_slug "$bucket_slug" \
-        --arg workspace_path "/app/workspace/shared/${bucket_slug}" \
+        --arg workspace_path "/app/workspace/Shared/${bucket_slug}" \
         --arg ak "$ak" --arg sk "$sk" \
-        --arg gid "g_${POD_NUM}_${bucket}_$(date -u +%s)" \
+        --arg gid "g_${GRANT_IDENTITY}_${bucket}_$(date -u +%s)" \
         --arg exp "$(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)" \
         '{name:$name, endpoint:$endpoint, region:"garage",
           access_key:$ak, secret_key:$sk, perms:"rw",
@@ -305,6 +367,8 @@ done
 # Mark first bucket as default
 buckets_json=$(printf '%s\n' "${CRED_BLOBS[@]}" \
     | jq -s '[ .[0] + {default:true} ] + .[1:]')
+selected_slugs_json=$(printf '%s\n' "${CRED_BLOBS[@]}" | jq -sc '[.[].folder_slug]')
+selected_buckets_json=$(printf '%s\n' "${CRED_BLOBS[@]}" | jq -sc '[.[].name]')
 
 now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 next_refresh=$(date -u -v+23d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -343,22 +407,76 @@ cp "$WRAPPER_LOCAL" "$TMP/garagetytus-shared"
 chmod 755 "$TMP/garagetytus-shared"
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-    # Per-invocation unique tempdir on droplet — concurrent provisions
-    # of different pods MUST NOT race on shared /tmp paths. (Bug caught
-    # 2026-04-26 by parallel folder-bind: pod-02 ended up with pod-04's
-    # credentials.json because both wrote to /tmp/credentials.json.)
-    DROP_TMP="/tmp/garagetytus-prov-${POD_NUM}-$$-$(date +%s)"
-    run_droplet "mkdir -p ${DROP_TMP}"
-    scp -q "$TMP/credentials.json" "$TMP/_last-provision.json" \
-        "$TMP/garagetytus-shared" "$DROPLET":"${DROP_TMP}/"
-    run_pod "mkdir -p /app/workspace/.garagetytus /app/workspace/shared /app/workspace/.tytus/bin"
-    run_droplet "docker cp ${DROP_TMP}/garagetytus-shared ${CONTAINER}:/app/workspace/.garagetytus/garagetytus-shared && \
-                 docker cp ${DROP_TMP}/credentials.json ${CONTAINER}:/app/workspace/.garagetytus/credentials.json && \
-                 docker cp ${DROP_TMP}/_last-provision.json ${CONTAINER}:/app/workspace/.garagetytus/_last-provision.json"
+    run_pod "python3 - <<'PY'
+from pathlib import Path
+import os, shutil
+home = Path('/app/workspace')
+canonical = home / 'Shared'
+lower = home / 'shared'
+if lower.exists() and not lower.is_symlink() and not canonical.exists():
+    lower.rename(canonical)
+canonical.mkdir(parents=True, exist_ok=True)
+if not lower.exists():
+    lower.symlink_to('Shared', target_is_directory=True)
+PY
+mkdir -p /app/workspace/.garagetytus /app/workspace/.tytus/bin"
+    copy_to_pod "$TMP/garagetytus-shared" "/app/workspace/.garagetytus/garagetytus-shared"
+    copy_to_pod "$TMP/credentials.json" "/app/workspace/.garagetytus/credentials.json"
+    copy_to_pod "$TMP/_last-provision.json" "/app/workspace/.garagetytus/_last-provision.json"
     run_pod "chmod 755 /app/workspace/.garagetytus/garagetytus-shared && \
              chmod 600 /app/workspace/.garagetytus/credentials.json && \
              chmod 644 /app/workspace/.garagetytus/_last-provision.json"
-    run_droplet "rm -rf ${DROP_TMP}"
+    run_pod "SELECTED_SLUGS='${selected_slugs_json}' SELECTED_BUCKETS='${selected_buckets_json}' python3 - <<'PY'
+import datetime as dt
+import json
+import os
+import shutil
+from pathlib import Path
+root = Path('/app/workspace/Shared')
+try:
+    selected_slugs = set(json.loads(os.environ.get('SELECTED_SLUGS') or '[]'))
+    selected_buckets = set(json.loads(os.environ.get('SELECTED_BUCKETS') or '[]'))
+except Exception:
+    selected_slugs = set()
+    selected_buckets = set()
+if root.exists():
+    stamp = dt.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    for child in sorted(root.iterdir(), key=lambda p: p.name):
+        if not child.is_dir():
+            continue
+        if child.name.startswith('.tmp-'):
+            shutil.rmtree(child, ignore_errors=True)
+            print(f'removed stale temp shared folder {child.name}', flush=True)
+            continue
+        if child.name.startswith('.'):
+            continue
+        manifest = child / '.tytus-shared-manifest.json'
+        bucket = ''
+        if manifest.exists():
+            try:
+                bucket = (json.load(open(manifest)).get('bucket') or '')
+            except Exception:
+                bucket = ''
+        if child.name not in selected_slugs or (manifest.exists() and bucket not in selected_buckets):
+            try:
+                has_payload = any(p.is_file() or p.is_symlink() for p in child.rglob('*'))
+            except Exception:
+                has_payload = True
+            if not has_payload and not manifest.exists():
+                shutil.rmtree(child, ignore_errors=True)
+                print(f'removed empty non-selected shared folder {child.name}', flush=True)
+                continue
+            if manifest.exists():
+                target = root / ('.stale-' + child.name + '-' + stamp)
+                i = 1
+                while target.exists():
+                    target = root / ('.stale-' + child.name + '-' + stamp + '-' + str(i))
+                    i += 1
+                child.rename(target)
+                print(f'quarantined stale shared folder {child.name} -> {target.name}', flush=True)
+            else:
+                print(f'left non-selected non-empty folder without manifest: {child.name}', flush=True)
+PY" >&2
 fi
 
 # ── 4. build the systemPromptOverride append ──────────────────────
@@ -440,49 +558,66 @@ EOF
 fragment="$(cat "$FRAGMENT_FILE")"
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-    # Read base prompt + current overlay from pod
-    base_prompt=$(run_pod "jq -r '.agents.defaults.systemPromptOverride // \"\"' /app/workspace/.openclaw/config.json")
-    current_overlay=$(run_pod "cat /app/workspace/.openclaw/config.user.json 2>/dev/null || echo '{}'")
-    overlay_prompt=$(printf '%s' "$current_overlay" \
-        | jq -r '.agents.defaults.systemPromptOverride // ""')
+    copy_to_pod "$FRAGMENT_FILE" "/app/workspace/.garagetytus/shared-folders-prompt.md"
 
-    # If overlay already has our marker, strip from marker → EOF and rebuild.
-    # Otherwise: start from base_prompt, append our fragment.
-    if [[ "$overlay_prompt" == *"$MARKER"* ]]; then
-        # Take everything before the marker; will re-append fresh fragment.
-        cleaned=$(printf '%s' "$overlay_prompt" \
-            | awk -v m="$MARKER" 'BEGIN{p=1} index($0,m){p=0} p{print}')
-        new_prompt="${cleaned}${fragment}"
-    elif [[ -n "$overlay_prompt" ]]; then
-        new_prompt="${overlay_prompt}${fragment}"
+    agent_config_kind=$(run_pod "if [ -d /app/workspace/.openclaw ]; then echo openclaw; elif [ -d /app/workspace/.hermes ]; then echo hermes; else echo none; fi" | tr -d '\r\n')
+    if [[ "$agent_config_kind" == "openclaw" ]]; then
+        # Read base prompt + current overlay from pod. OpenClaw exposes a JSON
+        # overlay; Hermes pods currently do not, so those get the prompt file
+        # above and skip overlay mutation instead of failing on jq/config paths.
+        base_prompt=$(run_pod "python3 - <<'PY'
+import json
+try:
+    data = json.load(open('/app/workspace/.openclaw/config.json'))
+    print((((data.get('agents') or {}).get('defaults') or {}).get('systemPromptOverride') or ''), end='')
+except Exception:
+    print('', end='')
+PY")
+        current_overlay=$(run_pod "cat /app/workspace/.openclaw/config.user.json 2>/dev/null || echo '{}'")
+        overlay_prompt=$(printf '%s' "$current_overlay" \
+            | jq -r '.agents.defaults.systemPromptOverride // ""')
+
+        # If overlay already has our marker, strip from marker → EOF and rebuild.
+        # Otherwise: start from base_prompt, append our fragment.
+        if [[ "$overlay_prompt" == *"$MARKER"* ]]; then
+            # Take everything before the marker; will re-append fresh fragment.
+            cleaned=$(printf '%s' "$overlay_prompt" \
+                | awk -v m="$MARKER" 'BEGIN{p=1} index($0,m){p=0} p{print}')
+            new_prompt="${cleaned}${fragment}"
+        elif [[ -n "$overlay_prompt" ]]; then
+            new_prompt="${overlay_prompt}${fragment}"
+        else
+            new_prompt="${base_prompt}${fragment}"
+        fi
+
+        new_overlay=$(printf '%s' "$current_overlay" \
+            | jq --arg sp "$new_prompt" \
+                '.agents = (.agents // {}) | .agents.defaults = (.agents.defaults // {}) | .agents.defaults.systemPromptOverride = $sp')
+
+        printf '%s' "$new_overlay" > "$TMP/config.user.json"
+        # Backup pod's existing overlay before overwrite
+        run_pod "cp /app/workspace/.openclaw/config.user.json /app/workspace/.openclaw/config.user.json.bak.\$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true"
+        copy_to_pod "$TMP/config.user.json" "/app/workspace/.openclaw/config.user.json"
     else
-        new_prompt="${base_prompt}${fragment}"
+        note "  prompt overlay skipped for ${agent_config_kind} pod; wrote /app/workspace/.garagetytus/shared-folders-prompt.md"
     fi
-
-    new_overlay=$(printf '%s' "$current_overlay" \
-        | jq --arg sp "$new_prompt" \
-            '.agents = (.agents // {}) | .agents.defaults = (.agents.defaults // {}) | .agents.defaults.systemPromptOverride = $sp')
-
-    printf '%s' "$new_overlay" > "$TMP/config.user.json"
-    # Per-invocation unique path on droplet to avoid concurrent races
-    DROP_OVERLAY="/tmp/garagetytus-overlay-${POD_NUM}-$$-$(date +%s).json"
-    scp -q "$TMP/config.user.json" "$DROPLET":"${DROP_OVERLAY}"
-    # Backup pod's existing overlay before overwrite
-    run_pod "cp /app/workspace/.openclaw/config.user.json /app/workspace/.openclaw/config.user.json.bak.\$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true"
-    run_droplet "docker cp ${DROP_OVERLAY} ${CONTAINER}:/app/workspace/.openclaw/config.user.json && \
-                 rm -f ${DROP_OVERLAY}"
 fi
 
 # ── 5. restart pod so the overlay merges into the live config ─────
 note "phase 5/6 — restart ${CONTAINER} (skip with --no-restart)"
 if [[ "$NO_RESTART" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
-    run_droplet "docker restart ${CONTAINER}" >/dev/null
-    # Brief wait so the container's healthcheck reports back
-    for _ in $(seq 1 20); do
-        s=$(run_droplet "docker inspect -f '{{.State.Health.Status}}' ${CONTAINER}" 2>/dev/null || echo unknown)
-        [[ "$s" == "healthy" ]] && break
-        sleep 1
-    done
+    if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
+        "$TYTUS_BIN" restart --pod "$POD_SELECTOR" >/dev/null
+        s="$("$TYTUS_BIN" doctor --pod "$POD_SELECTOR" --json 2>/dev/null | jq -r '.healthy // "unknown"' || echo unknown)"
+    else
+        run_droplet "docker restart ${CONTAINER}" >/dev/null
+        # Brief wait so the container's healthcheck reports back
+        for _ in $(seq 1 20); do
+            s=$(run_droplet "docker inspect -f '{{.State.Health.Status}}' ${CONTAINER}" 2>/dev/null || echo unknown)
+            [[ "$s" == "healthy" ]] && break
+            sleep 1
+        done
+    fi
     note "  container health: ${s:-unknown}"
 fi
 
@@ -493,13 +628,17 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     run_pod "python3 /app/workspace/.garagetytus/garagetytus-shared buckets" >&2
 fi
 
-# ── 7. materialize selected folders into /app/workspace/shared/<slug> ─
+# ── 7. materialize selected folders into /app/workspace/Shared/<slug> ─
 note "phase 7/7 — materialize shared folders into pod workspace"
 if [[ "$DRY_RUN" -eq 0 ]]; then
     if [[ -x "$MATERIALIZE_SCRIPT" ]]; then
         for bucket in "${BUCKETS[@]}"; do
             bucket_slug="${SLUG:-$(derive_slug "$bucket")}"
-            "$MATERIALIZE_SCRIPT" "$POD_NUM" --bucket "$bucket" --slug "$bucket_slug" --droplet "$DROPLET" >&2
+            if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
+                "$MATERIALIZE_SCRIPT" "$POD_SELECTOR" --bucket "$bucket" --slug "$bucket_slug" >&2
+            else
+                "$MATERIALIZE_SCRIPT" "$POD_NUM" --bucket "$bucket" --slug "$bucket_slug" --droplet "$DROPLET" >&2
+            fi
         done
     else
         note "  materializer missing at ${MATERIALIZE_SCRIPT}; credentials provisioned but files not materialized"

@@ -4,7 +4,7 @@
 # Usage:
 #   garagetytus-folder-materialize <pod-id> --bucket NAME [--slug SLUG] [--droplet HOST] [--dry-run]
 #
-# Copies legacy bucket-root objects into /app/workspace/shared/<slug>/.
+# Copies legacy bucket-root objects into /app/workspace/Shared/<slug>/.
 # This intentionally does not delete or modify the Mac-side source folder.
 
 set -euo pipefail
@@ -14,6 +14,9 @@ POD_ID=""
 BUCKET=""
 SLUG=""
 DRY_RUN=0
+TYTUS_BIN="${TYTUS_BIN:-tytus}"
+USE_TYTUS_POD_IO=0
+POD_SELECTOR=""
 
 err()  { printf 'folder-materialize: %s\n' "$*" >&2; exit 1; }
 note() { printf 'folder-materialize: %s\n' "$*" >&2; }
@@ -41,6 +44,35 @@ case "$POD_ID" in
     wannolot-*|tytus-*) POD_NUM="${POD_ID##*-}";;
     *) POD_NUM="$POD_ID";;
 esac
+if [[ ! "$POD_NUM" =~ ^[0-9]+$ ]]; then
+    POD_SELECTOR="$POD_ID"
+    USE_TYTUS_POD_IO=1
+    state_path="${TYTUS_STATE_PATH:-${HOME}/Library/Application Support/tytus/state.json}"
+    POD_NUM=$(python3 - "$state_path" "$POD_ID" <<'PY'
+import json, sys
+path, selector = sys.argv[1], sys.argv[2].lower()
+try:
+    data = json.load(open(path))
+except Exception:
+    sys.exit(1)
+for key in ("pods", "agents", "included"):
+    rows = data.get(key) or []
+    if not isinstance(rows, list):
+        continue
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if any(str(row.get(k) or "").lower() == selector for k in ("route_id", "id")):
+            raw = str(row.get("pod_id") or "").strip()
+            if raw:
+                print(raw.zfill(2))
+                sys.exit(0)
+sys.exit(1)
+PY
+) || err "pod selector ${POD_ID} is not numeric and was not found in local Tytus state"
+    note "resolved route selector ${POD_ID} -> pod ${POD_NUM}; pod I/O via tytus route"
+fi
+POD_SELECTOR="${POD_SELECTOR:-$POD_NUM}"
 CONTAINER="tytus-${POD_NUM}"
 
 if [[ -z "$SLUG" ]]; then
@@ -146,13 +178,20 @@ s3 = boto3.client(
     config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3, "mode": "standard"}),
 )
 
-shared_root = home / "shared"
+shared_root = home / "Shared"
+lower_shared = home / "shared"
 try:
+    if lower_shared.exists() and not lower_shared.is_symlink() and not shared_root.exists():
+        lower_shared.rename(shared_root)
     shared_root.mkdir(parents=True, exist_ok=True)
+    if not lower_shared.exists():
+        lower_shared.symlink_to("Shared", target_is_directory=True)
 except FileExistsError:
     pass
 
 dest = shared_root / slug
+for old_tmp in shared_root.glob(f".tmp-{slug}-*"):
+    shutil.rmtree(old_tmp, ignore_errors=True)
 tmp = shared_root / f".tmp-{slug}-{os.getpid()}"
 if tmp.exists():
     shutil.rmtree(tmp)
@@ -221,10 +260,70 @@ PY
 
 REMOTE_TMP="/tmp/garagetytus-materialize-${POD_NUM}-$$-$(date +%s).py"
 REMOTE_IN_CONTAINER="/app/workspace/.garagetytus/materialize.py"
-scp -q "$PYFILE" "$DROPLET":"$REMOTE_TMP"
-ssh -o BatchMode=yes "$DROPLET" \
-  "docker exec '${CONTAINER}' mkdir -p /app/workspace/.garagetytus && \
-   docker exec -i '${CONTAINER}' sh -c 'cat > ${REMOTE_IN_CONTAINER}' < '$REMOTE_TMP' && \
-   rm -f '$REMOTE_TMP' && \
-   docker exec '${CONTAINER}' python3 '${REMOTE_IN_CONTAINER}' '$BUCKET' '$SLUG'"
-note "✅ materialized ${BUCKET} in ${CONTAINER}:/app/workspace/shared/${SLUG}"
+if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
+    "$TYTUS_BIN" exec --pod "$POD_SELECTOR" -- 'mkdir -p /app/workspace/.garagetytus' >/dev/null
+    "$TYTUS_BIN" push --pod "$POD_SELECTOR" --to "$REMOTE_IN_CONTAINER" --quiet "$PYFILE" --json >/dev/null
+    exec_timeout="${TYTUS_POD_EXEC_TIMEOUT:-600}"
+    start_epoch=$(date -u +%s)
+    if ! raw=$("$TYTUS_BIN" --json exec --pod "$POD_SELECTOR" --timeout "$exec_timeout" "python3 '${REMOTE_IN_CONTAINER}' '$BUCKET' '$SLUG'"); then
+        note "tytus exec transport failed; checking whether materialization completed on pod"
+        verify=""
+        exit_code=1
+        stdout=""
+        stderr=""
+        # A provider-side transport failure can arrive before the in-pod
+        # process finishes. Poll for the final manifest before declaring
+        # failure; this preserves correctness for large buckets.
+        for _ in $(seq 1 "${TYTUS_VERIFY_RETRIES:-60}"); do
+            if verify=$("$TYTUS_BIN" --json exec --pod "$POD_SELECTOR" --timeout 30 "python3 - <<'PY'
+import datetime as dt, json, pathlib, sys
+p = pathlib.Path('/app/workspace/Shared') / '$SLUG' / '.tytus-shared-manifest.json'
+try:
+    d = json.load(open(p))
+except Exception as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(1)
+if d.get('bucket') != '$BUCKET':
+    print('manifest bucket mismatch', file=sys.stderr)
+    sys.exit(1)
+updated = d.get('updated_at') or ''
+try:
+    updated_epoch = int(dt.datetime.fromisoformat(updated.replace('Z','+00:00')).timestamp())
+except Exception:
+    updated_epoch = 0
+if updated_epoch < int('$start_epoch'):
+    print('manifest is stale', file=sys.stderr)
+    sys.exit(1)
+print(json.dumps({'status':'materialized','bucket':d.get('bucket'),'slug':d.get('slug'),'workspace_path':str(p.parent),'object_count':d.get('object_count'),'skipped':d.get('skipped'),'transport':'verified-after-tytus-exec-failure'}))
+PY"); then
+                exit_code=$(printf '%s' "$verify" | jq -r '.exit_code // 1')
+                stdout=$(printf '%s' "$verify" | jq -r '.stdout // ""')
+                stderr=$(printf '%s' "$verify" | jq -r '.stderr // ""')
+                [[ "$exit_code" == "0" ]] && break
+            fi
+            sleep 2
+        done
+        [[ -n "$stdout" ]] && printf '%s' "$stdout"
+        if [[ "$exit_code" != "0" ]]; then
+            [[ -n "$stderr" ]] && printf '%s\n' "$stderr" >&2
+            exit "$exit_code"
+        fi
+    else
+        exit_code=$(printf '%s' "$raw" | jq -r '.exit_code // 1')
+        stdout=$(printf '%s' "$raw" | jq -r '.stdout // ""')
+        stderr=$(printf '%s' "$raw" | jq -r '.stderr // ""')
+        [[ -n "$stdout" ]] && printf '%s' "$stdout"
+        if [[ "$exit_code" != "0" ]]; then
+            [[ -n "$stderr" ]] && printf '%s\n' "$stderr" >&2
+            exit "$exit_code"
+        fi
+    fi
+else
+    scp -q "$PYFILE" "$DROPLET":"$REMOTE_TMP"
+    ssh -o BatchMode=yes "$DROPLET" \
+      "docker exec '${CONTAINER}' mkdir -p /app/workspace/.garagetytus && \
+       docker exec -i '${CONTAINER}' sh -c 'cat > ${REMOTE_IN_CONTAINER}' < '$REMOTE_TMP' && \
+       rm -f '$REMOTE_TMP' && \
+       docker exec '${CONTAINER}' python3 '${REMOTE_IN_CONTAINER}' '$BUCKET' '$SLUG'"
+fi
+note "✅ materialized ${BUCKET} in ${CONTAINER}:/app/workspace/Shared/${SLUG}"
