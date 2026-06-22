@@ -29,6 +29,7 @@ for helper in \
   garagetytus-folder-bind \
   garagetytus-folder-sync \
   garagetytus-refresh-watchdog \
+  garagetytus-folder-materialize \
   garagetytus-pod-provision \
   garagetytus-pod-refresh \
   garagetytus-pod-deprovision \
@@ -36,7 +37,7 @@ for helper in \
   /bin/bash -n "$ROOT/bin/$helper"
 done
 
-if grep -R --line-number --fixed-strings 'mapfile' "$ROOT/bin/garagetytus-folder-sync" "$ROOT/bin/garagetytus-refresh-watchdog" "$ROOT/bin/garagetytus-pod-provision" "$ROOT/bin/garagetytus-pod-refresh" "$ROOT/bin/garagetytus-pod-deprovision" "$ROOT/bin/garagetytus-folder-status"; then
+if grep -R --line-number --fixed-strings 'mapfile' "$ROOT/bin/garagetytus-folder-sync" "$ROOT/bin/garagetytus-refresh-watchdog" "$ROOT/bin/garagetytus-folder-materialize" "$ROOT/bin/garagetytus-pod-provision" "$ROOT/bin/garagetytus-pod-refresh" "$ROOT/bin/garagetytus-pod-deprovision" "$ROOT/bin/garagetytus-folder-status"; then
   echo "Bash 4-only mapfile is forbidden in Tytus helpers; macOS /bin/bash is 3.2" >&2
   exit 1
 fi
@@ -73,6 +74,10 @@ grep -F 'skip_recent_automatic_incremental' "$ROOT/bin/garagetytus-folder-sync" 
 grep -F 'COOLDOWN_SEC=600' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
 grep -F -- '--force) FORCE=1' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
 grep -F '.last-attempt' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
+grep -F 'MATERIALIZE_MODE="${GARAGETYTUS_MATERIALIZE_MODE:-background}"' "$ROOT/bin/garagetytus-pod-provision" >/dev/null
+grep -F 'materialize_args+=(--background)' "$ROOT/bin/garagetytus-pod-provision" >/dev/null
+grep -F -- '--background) BACKGROUND=1' "$ROOT/bin/garagetytus-folder-materialize" >/dev/null
+grep -F 'queued background materialization' "$ROOT/bin/garagetytus-folder-materialize" >/dev/null
 if grep -F 'exec /usr/local/bin/timeout' "$ROOT/bin/garagetytus-folder-sync" >/dev/null; then
   echo "folder-sync must not exec timeout; the shell owns the global sync lock/trap" >&2
   exit 1

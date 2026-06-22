@@ -649,15 +649,24 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 fi
 
 # ── 7. materialize selected folders into /app/workspace/Shared/<slug> ─
-note "phase 7/7 — materialize shared folders into pod workspace"
+# Default is background: provisioning grants/prompts should return quickly, even
+# when a selected bucket contains thousands of objects. The pod gets credentials
+# immediately; the local folder sync and pod materialization can catch up like
+# Dropbox/Drive instead of blocking the TytusOS button.
+MATERIALIZE_MODE="${GARAGETYTUS_MATERIALIZE_MODE:-background}"
+materialize_args=()
+if [[ "$MATERIALIZE_MODE" != "blocking" ]]; then
+    materialize_args+=(--background)
+fi
+note "phase 7/7 — queue shared-folder materialization in pod workspace (${MATERIALIZE_MODE})"
 if [[ "$DRY_RUN" -eq 0 ]]; then
     if [[ -x "$MATERIALIZE_SCRIPT" ]]; then
         for bucket in "${BUCKETS[@]}"; do
             bucket_slug="${SLUG:-$(derive_slug "$bucket")}"
             if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
-                "$MATERIALIZE_SCRIPT" "$POD_SELECTOR" --bucket "$bucket" --slug "$bucket_slug" >&2
+                "$MATERIALIZE_SCRIPT" "$POD_SELECTOR" --bucket "$bucket" --slug "$bucket_slug" "${materialize_args[@]}" >&2
             else
-                "$MATERIALIZE_SCRIPT" "$POD_NUM" --bucket "$bucket" --slug "$bucket_slug" --droplet "$DROPLET" >&2
+                "$MATERIALIZE_SCRIPT" "$POD_NUM" --bucket "$bucket" --slug "$bucket_slug" --droplet "$DROPLET" "${materialize_args[@]}" >&2
             fi
         done
     else

@@ -2,7 +2,7 @@
 # garagetytus-folder-materialize — materialize a Garage shared bucket inside a Tytus pod.
 #
 # Usage:
-#   garagetytus-folder-materialize <pod-id> --bucket NAME [--slug SLUG] [--droplet HOST] [--dry-run]
+#   garagetytus-folder-materialize <pod-id> --bucket NAME [--slug SLUG] [--droplet HOST] [--dry-run] [--background]
 #
 # Copies legacy bucket-root objects into /app/workspace/Shared/<slug>/.
 # This intentionally does not delete or modify the Mac-side source folder.
@@ -14,6 +14,7 @@ POD_ID=""
 BUCKET=""
 SLUG=""
 DRY_RUN=0
+BACKGROUND=0
 TYTUS_BIN="${TYTUS_BIN:-tytus}"
 USE_TYTUS_POD_IO=0
 POD_SELECTOR=""
@@ -28,6 +29,7 @@ while [[ $# -gt 0 ]]; do
         --slug)    SLUG="$2"; shift 2;;
         --droplet) DROPLET="$2"; shift 2;;
         --dry-run) DRY_RUN=1; shift;;
+        --background) BACKGROUND=1; shift;;
         -h|--help) usage; exit 0;;
         --) shift; break;;
         -*) err "unknown flag: $1 (try --help)";;
@@ -111,6 +113,13 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     note "dry-run — no pod changes"
     exit 0
 fi
+
+shell_quote() {
+    python3 - "$1" <<'PY'
+import shlex, sys
+print(shlex.quote(sys.argv[1]))
+PY
+}
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -263,6 +272,41 @@ REMOTE_IN_CONTAINER="/app/workspace/.garagetytus/materialize.py"
 if [[ "$USE_TYTUS_POD_IO" -eq 1 ]]; then
     "$TYTUS_BIN" exec --pod "$POD_SELECTOR" -- 'mkdir -p /app/workspace/.garagetytus' >/dev/null
     "$TYTUS_BIN" push --pod "$POD_SELECTOR" --to "$REMOTE_IN_CONTAINER" --quiet "$PYFILE" --json >/dev/null
+    if [[ "$BACKGROUND" -eq 1 ]]; then
+        remote_log="/app/workspace/.garagetytus/materialize-${SLUG}.log"
+        status_json=$(python3 - "$BUCKET" "$SLUG" "$remote_log" <<'PY'
+import datetime as dt, json, sys
+bucket, slug, log_path = sys.argv[1:4]
+print(json.dumps({
+    "schema_version": 1,
+    "status": "materializing",
+    "bucket": bucket,
+    "slug": slug,
+    "log_path": log_path,
+    "started_at": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+}, sort_keys=True))
+PY
+)
+        bucket_q=$(shell_quote "$BUCKET")
+        slug_q=$(shell_quote "$SLUG")
+        remote_in_q=$(shell_quote "$REMOTE_IN_CONTAINER")
+        remote_log_q=$(shell_quote "$remote_log")
+        status_q=$(shell_quote "$status_json")
+        remote_cmd="mkdir -p /app/workspace/.garagetytus /app/workspace/Shared/${slug_q} && printf '%s' ${status_q} > /app/workspace/Shared/${slug_q}/.tytus-shared-status.json && nohup python3 ${remote_in_q} ${bucket_q} ${slug_q} > ${remote_log_q} 2>&1 < /dev/null & echo background-started"
+        if ! raw=$("$TYTUS_BIN" --json exec --pod "$POD_SELECTOR" --timeout 30 "$remote_cmd"); then
+            note "failed to start background materialization"
+            exit 1
+        fi
+        exit_code=$(printf '%s' "$raw" | jq -r '.exit_code // 1')
+        stdout=$(printf '%s' "$raw" | jq -r '.stdout // ""')
+        stderr=$(printf '%s' "$raw" | jq -r '.stderr // ""')
+        if [[ "$exit_code" != "0" ]]; then
+            [[ -n "$stderr" ]] && printf '%s\n' "$stderr" >&2
+            exit "$exit_code"
+        fi
+        note "queued background materialization ${BUCKET} in ${CONTAINER}:/app/workspace/Shared/${SLUG} (${stdout:-started})"
+        exit 0
+    fi
     exec_timeout="${TYTUS_POD_EXEC_TIMEOUT:-600}"
     start_epoch=$(date -u +%s)
     if ! raw=$("$TYTUS_BIN" --json exec --pod "$POD_SELECTOR" --timeout "$exec_timeout" "python3 '${REMOTE_IN_CONTAINER}' '$BUCKET' '$SLUG'"); then
@@ -320,10 +364,38 @@ PY"); then
     fi
 else
     scp -q "$PYFILE" "$DROPLET":"$REMOTE_TMP"
-    ssh -o BatchMode=yes "$DROPLET" \
-      "docker exec '${CONTAINER}' mkdir -p /app/workspace/.garagetytus && \
-       docker exec -i '${CONTAINER}' sh -c 'cat > ${REMOTE_IN_CONTAINER}' < '$REMOTE_TMP' && \
-       rm -f '$REMOTE_TMP' && \
-       docker exec '${CONTAINER}' python3 '${REMOTE_IN_CONTAINER}' '$BUCKET' '$SLUG'"
+    if [[ "$BACKGROUND" -eq 1 ]]; then
+        remote_log="/app/workspace/.garagetytus/materialize-${SLUG}.log"
+        status_json=$(python3 - "$BUCKET" "$SLUG" "$remote_log" <<'PY'
+import datetime as dt, json, sys
+bucket, slug, log_path = sys.argv[1:4]
+print(json.dumps({
+    "schema_version": 1,
+    "status": "materializing",
+    "bucket": bucket,
+    "slug": slug,
+    "log_path": log_path,
+    "started_at": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+}, sort_keys=True))
+PY
+)
+        status_q=$(shell_quote "$status_json")
+        bucket_q=$(shell_quote "$BUCKET")
+        slug_q=$(shell_quote "$SLUG")
+        remote_log_q=$(shell_quote "$remote_log")
+        ssh -o BatchMode=yes "$DROPLET" \
+          "docker exec '${CONTAINER}' mkdir -p /app/workspace/.garagetytus /app/workspace/Shared/${SLUG} && \
+           docker exec -i '${CONTAINER}' sh -c 'cat > ${REMOTE_IN_CONTAINER}' < '$REMOTE_TMP' && \
+           rm -f '$REMOTE_TMP' && \
+           docker exec -d '${CONTAINER}' sh -lc \"printf '%s' ${status_q} > /app/workspace/Shared/${slug_q}/.tytus-shared-status.json && nohup python3 '${REMOTE_IN_CONTAINER}' ${bucket_q} ${slug_q} > ${remote_log_q} 2>&1 < /dev/null\" >/dev/null"
+        note "queued background materialization ${BUCKET} in ${CONTAINER}:/app/workspace/Shared/${SLUG}"
+        exit 0
+    else
+        ssh -o BatchMode=yes "$DROPLET" \
+          "docker exec '${CONTAINER}' mkdir -p /app/workspace/.garagetytus && \
+           docker exec -i '${CONTAINER}' sh -c 'cat > ${REMOTE_IN_CONTAINER}' < '$REMOTE_TMP' && \
+           rm -f '$REMOTE_TMP' && \
+           docker exec '${CONTAINER}' python3 '${REMOTE_IN_CONTAINER}' '$BUCKET' '$SLUG'"
+    fi
 fi
 note "✅ materialized ${BUCKET} in ${CONTAINER}:/app/workspace/Shared/${SLUG}"
