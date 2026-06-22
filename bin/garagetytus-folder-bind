@@ -41,6 +41,37 @@ PLIST_DIR="${HOME}/Library/LaunchAgents"
 WORKDIR_BASE="${HOME}/.cache/garagetytus/bisync"
 LOG_BASE="/tmp/garagetytus-bisync"
 
+# Default sync hygiene. Shared folders are for user/project files, not generated
+# dependency stores. Without this, a "small" folder containing venv/node_modules
+# becomes thousands of tiny S3 writes and initial bind looks frozen.
+# Set GARAGETYTUS_SYNC_ALL=1 for an explicit full mirror.
+DEFAULT_EXCLUDES=(
+    ".DS_Store"
+    "**/.DS_Store"
+    ".git/**"
+    "**/.git/**"
+    "node_modules/**"
+    "**/node_modules/**"
+    ".venv/**"
+    "**/.venv/**"
+    "venv/**"
+    "**/venv/**"
+    "__pycache__/**"
+    "**/__pycache__/**"
+    ".pytest_cache/**"
+    "**/.pytest_cache/**"
+    ".mypy_cache/**"
+    "**/.mypy_cache/**"
+    ".ruff_cache/**"
+    "**/.ruff_cache/**"
+    ".cache/**"
+    "**/.cache/**"
+    ".env"
+    ".env.*"
+    "**/.env"
+    "**/.env.*"
+)
+
 LOCAL_PATH=""
 BUCKET=""
 PODS=()
@@ -49,7 +80,11 @@ INTERVAL=60
 TIMEOUT_SEC=300
 # Initial --resync must never be killed mid-listing: a partial resync leaves an
 # inconsistent bisync baseline. Keep this separate from poll timeout.
-RESYNC_TIMEOUT_SEC=1800
+# Initial --resync can be slow for real client workspaces with thousands of
+# small files. 30m was too short for ~/freelance-office and killed rclone before
+# it wrote the bisync baseline/sidecar. Keep poll sync bounded separately, but
+# give first bind enough room to finish safely.
+RESYNC_TIMEOUT_SEC=7200
 NO_POD_RESTART=0
 DRY_RUN=0
 REGISTRY=0
@@ -138,11 +173,151 @@ PLIST_PATH="${PLIST_DIR}/${PLIST_LABEL}.plist"
 WORKDIR="${WORKDIR_BASE}/${SAFE_NAME}"
 LOG_OUT="${LOG_BASE}-${SAFE_NAME}.log"
 LOG_ERR="${LOG_BASE}-${SAFE_NAME}.err"
+SIDECAR="${WORKDIR_BASE}/${SAFE_NAME}.bindings.json"
 
 note "target local=${LOCAL_PATH} bucket=${BUCKET}"
 [[ "${#PODS[@]}" -gt 0 ]] && note "target pods=${PODS[*]}"
 [[ "$AUTO_SYNC" -eq 1 ]] && note "auto-sync ON (interval=${INTERVAL}s, timeout=${TIMEOUT_SEC}s)"
 [[ "$DRY_RUN"   -eq 1 ]] && note "DRY-RUN — no remote/local changes"
+
+unload_existing_auto_sync() {
+    [[ "$AUTO_SYNC" -eq 1 && "$DRY_RUN" -eq 0 ]] || return 0
+    [[ -f "$PLIST_PATH" ]] || return 0
+    note "  unloading existing launchd job before initial resync"
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+}
+
+write_binding_sidecar() {
+    local state="$1"; shift || true
+    [[ "$DRY_RUN" -eq 0 ]] || return 0
+    mkdir -p "$WORKDIR_BASE"
+    local bound_at pods_json status_json targets_json tmp sync_state sync_phase
+    bound_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    sync_state="${SYNC_STATE:-pending}"
+    sync_phase="${SYNC_PHASE:-initial_resync}"
+
+    if [[ "$#" -gt 0 ]]; then
+        pods_json=$(printf '%s\n' "$@" | jq -R '
+            def selector: if test("^(wannolot|tytus)-") then sub("^(wannolot|tytus)-"; "") else . end;
+            select(length > 0)
+            | selector as $sel
+            | if ($sel | test("^[0-9]+$")) then "wannolot-" + $sel else $sel end
+        ' | jq -s .)
+        status_json=$(printf '%s\n' "$@" | jq -R --arg slug "$SLUG" --arg state "$state" '
+            def selector: if test("^(wannolot|tytus)-") then sub("^(wannolot|tytus)-"; "") else . end;
+            select(length > 0)
+            | selector as $rid
+            | {key: $rid, value: {
+                state: $state,
+                workspace_path: ("/app/workspace/shared/" + $slug),
+                helper_mode: "legacy_bucket_root",
+                last_materialized_at: (if $state == "materialized" then (now | todateiso8601) else null end),
+                last_error: null
+              }}
+        ' | jq -s 'from_entries')
+        targets_json=$(printf '%s\n' "$@" | jq -R '
+            def selector: if test("^(wannolot|tytus)-") then sub("^(wannolot|tytus)-"; "") else . end;
+            select(length > 0)
+            | selector as $sel
+            | {
+                runtime_id: $sel,
+                route_id: (if ($sel | test("^[0-9]+$")) then null else $sel end),
+                provision_selector: $sel,
+                kind: "agent-runtime",
+                labels: [],
+                enabled: true
+              }
+        ' | jq -s .)
+    else
+        pods_json='[]'
+        status_json='{}'
+        targets_json='[]'
+    fi
+
+    tmp="${SIDECAR}.tmp.$$"
+    jq -n \
+        --arg bucket "$BUCKET" \
+        --arg local "$LOCAL_PATH" \
+        --arg slug "$SLUG" \
+        --arg folder_id "$FOLDER_ID" \
+        --arg ts "$bound_at" \
+        --argjson pods "$pods_json" \
+        --argjson targets "$targets_json" \
+        --argjson runtime_status "$status_json" \
+        --argjson interval "${INTERVAL}" \
+        --argjson auto "$AUTO_SYNC" \
+        --arg label "$PLIST_LABEL" \
+        --arg workdir "$WORKDIR" \
+        --arg remote "$RCLONE_REMOTE" \
+        --arg remote_path "${REMOTE_PATH#${RCLONE_REMOTE}:}" \
+        --arg sync_state "$sync_state" \
+        --arg sync_phase "$sync_phase" \
+        '{schema_version:2, bound_at:$ts, folder_id:$folder_id, slug:$slug,
+          bucket:$bucket, sync_layout:"legacy_bucket_root",
+          remote:$remote, remote_path:$remote_path,
+          local_path:$local, pods_provisioned:$pods,
+          targets:$targets, runtime_status:$runtime_status,
+          sync_status:{state:$sync_state, phase:$sync_phase, checked_at:$ts, baseline_ready:false},
+          auto_sync:($auto==1), interval_sec:$interval,
+          plist_label:$label, workdir:$workdir}' \
+        > "$tmp"
+    mv "$tmp" "$SIDECAR"
+}
+
+install_auto_sync_plist() {
+    if [[ "$AUTO_SYNC" -eq 1 ]]; then
+        note "  install launchd plist (StartInterval=${INTERVAL}, timeout=${TIMEOUT_SEC})"
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            mkdir -p "$PLIST_DIR"
+            # Per Q14 Option 1: NO WatchPaths, NO KeepAlive. Just polling
+            # interval + bounded timeout per run. Install only after sidecar
+            # exists, so background sync cannot race the bind/provision job.
+            cat > "$PLIST_PATH" <<PLEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/garagetytus-folder-sync</string>
+    <string>--rclone-conf</string>
+    <string>${RCLONE_CONF}</string>
+    <string>--remote</string>
+    <string>${RCLONE_REMOTE}</string>
+    <string>--remote-path</string>
+    <string>${REMOTE_PATH#${RCLONE_REMOTE}:}</string>
+    <string>--workdir</string>
+    <string>${WORKDIR}</string>
+    <string>--timeout</string>
+    <string>${TIMEOUT_SEC}</string>
+    <string>--resync-timeout</string>
+    <string>${RESYNC_TIMEOUT_SEC}</string>
+    <string>${LOCAL_PATH}</string>
+    <string>${BUCKET}</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>${INTERVAL}</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${LOG_OUT}</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_ERR}</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+PLEOF
+            launchctl unload "$PLIST_PATH" 2>/dev/null || true
+            launchctl load "$PLIST_PATH"
+            note "  launchd job ${PLIST_LABEL} loaded"
+        fi
+    else
+        note "phase 7/7 — skipped (no --auto-sync; one-shot bisync only)"
+    fi
+}
 
 canonical_local_path() {
     python3 - "$1" <<'PY'
@@ -340,11 +515,12 @@ else
     fi
 fi
 
-note "phase 4/6 — mkdir + initial bisync --resync"
+note "phase 4/7 — register binding + prepare background sync"
 mkdir -p "$LOCAL_PATH" "$WORKDIR"
+unload_existing_auto_sync
 # rclone bisync's safety check refuses to sync if the prior path1
 # listing is empty ("Empty prior Path1 listing"). An empty initial
-# --resync poisons subsequent runs. Drop a sentinel file BEFORE the
+# --resync poisons subsequent runs. Drop a sentinel file BEFORE any
 # initial sync so path1.lst always has at least one entry.
 MARKER_FILE="${LOCAL_PATH}/.garagetytus-bound"
 if [[ ! -f "$MARKER_FILE" ]]; then
@@ -355,64 +531,35 @@ Bound by: $(whoami)@$(hostname -s)
 Do not delete this marker — bisync uses it to track folder identity.
 MEOF
 fi
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    /usr/local/bin/timeout "$RESYNC_TIMEOUT_SEC" rclone --config "$RCLONE_CONF" \
-        bisync "$LOCAL_PATH" "${REMOTE_PATH}" \
-        --workdir "$WORKDIR" \
-        --create-empty-src-dirs \
-        --resync \
-        --max-lock 2m 2>&1 | sed 's/^/    /' || \
-        err "initial bisync --resync failed"
-    note "  initial sync complete: ${LOCAL_PATH} ↔ ${REMOTE_PATH}"
-fi
 
-# ── 5. (optional) launchd plist for polling auto-sync ─────────────
+# Bind registration must be fast. The shared-folders view can show "Syncing…"
+# while launchd/rclone performs the expensive initial --resync in the background.
+SYNC_STATE="syncing" SYNC_PHASE="initial_resync" write_binding_sidecar "provisioning" "${PODS[@]}"
+
 if [[ "$AUTO_SYNC" -eq 1 ]]; then
-    note "phase 5/6 — install launchd plist (StartInterval=${INTERVAL}, timeout=${TIMEOUT_SEC})"
-    if [[ "$DRY_RUN" -eq 0 ]]; then
-        mkdir -p "$PLIST_DIR"
-        # Per Q14 Option 1: NO WatchPaths, NO KeepAlive. Just polling
-        # interval + bounded timeout per run.
-        cat > "$PLIST_PATH" <<PLEOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${PLIST_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/env</string>
-    <string>bash</string>
-    <string>-c</string>
-    <string>/usr/local/bin/timeout ${TIMEOUT_SEC} /usr/local/bin/rclone --config "${RCLONE_CONF}" bisync "${LOCAL_PATH}" "${REMOTE_PATH}" --workdir "${WORKDIR}" --max-lock 2m --create-empty-src-dirs --conflict-resolve newer --resilient</string>
-  </array>
-  <key>StartInterval</key>
-  <integer>${INTERVAL}</integer>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>${LOG_OUT}</string>
-  <key>StandardErrorPath</key>
-  <string>${LOG_ERR}</string>
-  <key>ProcessType</key>
-  <string>Background</string>
-</dict>
-</plist>
-PLEOF
-        # Reload to pick up changes if already loaded
-        launchctl unload "$PLIST_PATH" 2>/dev/null || true
-        launchctl load "$PLIST_PATH"
-        note "  launchd job ${PLIST_LABEL} loaded"
-    fi
+    note "phase 5/7 — start background initial sync"
+    install_auto_sync_plist
 else
-    note "phase 5/6 — skipped (no --auto-sync; one-shot bisync only)"
+    note "phase 5/7 — initial bisync --resync (foreground; --auto-sync disabled)"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        /usr/local/bin/garagetytus-folder-sync \
+            --rclone-conf "$RCLONE_CONF" \
+            --remote "$RCLONE_REMOTE" \
+            --remote-path "${REMOTE_PATH#${RCLONE_REMOTE}:}" \
+            --workdir "$WORKDIR" \
+            --timeout "$TIMEOUT_SEC" \
+            --resync-timeout "$RESYNC_TIMEOUT_SEC" \
+            "$LOCAL_PATH" "$BUCKET" 2>&1 | sed 's/^/    /' || \
+            err "initial bisync --resync failed"
+        note "  initial sync complete: ${LOCAL_PATH} ↔ ${REMOTE_PATH}"
+    fi
+    SYNC_STATE="synced" SYNC_PHASE="idle" write_binding_sidecar "provisioning" "${PODS[@]}"
 fi
 
 # ── 6. (optional) provision named pods, in parallel ───────────────
 declare -a provisioned_pods=()
 if [[ "${#PODS[@]}" -gt 0 ]]; then
-    note "phase 6/6 — provision pods (parallel): ${PODS[*]}"
+    note "phase 6/7 — provision pods (parallel): ${PODS[*]}"
     [[ -x "$PROVISION_SCRIPT" ]] || err "missing ${PROVISION_SCRIPT}"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -420,10 +567,7 @@ if [[ "${#PODS[@]}" -gt 0 ]]; then
             note "  DRY: would call ${PROVISION_SCRIPT} ${pod} --bucket ${BUCKET}"
         done
         for pod in "${PODS[@]}"; do
-            case "$pod" in
-                wannolot-*|tytus-*) provisioned_pods+=("wannolot-${pod##*-}");;
-                *) provisioned_pods+=("wannolot-${pod}");;
-            esac
+            provisioned_pods+=("$pod")
         done
     else
         # Launch every pod-provision in background, capture log + pid.
@@ -443,10 +587,7 @@ if [[ "${#PODS[@]}" -gt 0 ]]; then
         declare -a failed_pods=()
         for pod in "${PODS[@]}"; do
             if wait "${pod_pids[$pod]}"; then
-                case "$pod" in
-                    wannolot-*|tytus-*) provisioned_pods+=("wannolot-${pod##*-}");;
-                    *) provisioned_pods+=("wannolot-${pod}");;
-                esac
+                provisioned_pods+=("$pod")
             else
                 failed_pods+=("$pod")
             fi
@@ -456,51 +597,15 @@ if [[ "${#PODS[@]}" -gt 0 ]]; then
         [[ "${#failed_pods[@]}" -gt 0 ]] && err "pod-provision failed for: ${failed_pods[*]}"
     fi
 else
-    note "phase 6/6 — skipped (no --to pods)"
+    note "phase 6/7 — skipped (no --to pods)"
 fi
 
-# ── 7. write sidecar binding metadata (always) ─────────────────────
-SIDECAR="${WORKDIR_BASE}/${SAFE_NAME}.bindings.json"
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    bound_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    pods_json=$(printf '%s\n' "${provisioned_pods[@]}" | jq -R . | jq -s .)
-    [[ "${#provisioned_pods[@]}" -eq 0 ]] && pods_json='[]'
-    status_json=$(printf '%s\n' "${provisioned_pods[@]}" | jq -R --arg slug "$SLUG" '
-        select(length > 0)
-        | sub("^(wannolot|tytus)-"; "")
-        | {key: ., value: {
-            state: "materialized",
-            workspace_path: ("/app/workspace/shared/" + $slug),
-            helper_mode: "legacy_bucket_root",
-            last_materialized_at: (now | todateiso8601),
-            last_error: null
-          }}' | jq -s 'from_entries')
-    [[ "${#provisioned_pods[@]}" -eq 0 ]] && status_json='{}'
-    targets_json=$(printf '%s\n' "${provisioned_pods[@]}" | jq -R '
-        select(length > 0)
-        | sub("^(wannolot|tytus)-"; "")
-        | {runtime_id: ., kind: "agent-runtime", labels: [], enabled: true}' | jq -s .)
-    [[ "${#provisioned_pods[@]}" -eq 0 ]] && targets_json='[]'
-    jq -n \
-        --arg bucket "$BUCKET" \
-        --arg local "$LOCAL_PATH" \
-        --arg slug "$SLUG" \
-        --arg folder_id "$FOLDER_ID" \
-        --arg ts "$bound_at" \
-        --argjson pods "$pods_json" \
-        --argjson targets "$targets_json" \
-        --argjson runtime_status "$status_json" \
-        --argjson interval "${INTERVAL}" \
-        --argjson auto "$AUTO_SYNC" \
-        --arg label "$PLIST_LABEL" \
-        --arg workdir "$WORKDIR" \
-        '{schema_version:2, bound_at:$ts, folder_id:$folder_id, slug:$slug,
-          bucket:$bucket, sync_layout:"legacy_bucket_root",
-          local_path:$local, pods_provisioned:$pods,
-          targets:$targets, runtime_status:$runtime_status,
-          auto_sync:($auto==1), interval_sec:$interval,
-          plist_label:$label, workdir:$workdir}' \
-        > "$SIDECAR"
+# ── 7. finalize sidecar ────────────────────────────────────────────
+note "phase 7/7 — finalize binding sidecar"
+if [[ "$AUTO_SYNC" -eq 1 ]]; then
+    SYNC_STATE="syncing" SYNC_PHASE="initial_resync" write_binding_sidecar "materialized" "${provisioned_pods[@]}"
+else
+    SYNC_STATE="synced" SYNC_PHASE="idle" write_binding_sidecar "materialized" "${provisioned_pods[@]}"
 fi
 
-note "✅ folder-bind complete: ${LOCAL_PATH} ↔ ${REMOTE_PATH}"
+note "✅ folder-bind complete: ${LOCAL_PATH} ↔ ${REMOTE_PATH} (file sync continues in background when auto-sync is enabled)"

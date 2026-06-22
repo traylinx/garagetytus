@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# garagetytus-folder-sync — one-shot sync for a registered local folder.
+# Auto-detects whether bisync has a valid baseline. If not, runs the initial
+# --resync path; otherwise runs incremental bisync. Safe for Tytus manual
+# "Sync now" / "Retry sync" buttons.
+set -euo pipefail
+
+RCLONE_REMOTE="garagetytus"
+RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"
+WORKDIR_BASE="${HOME}/.cache/garagetytus/bisync"
+GLOBAL_LOCK_DIR="${TMPDIR:-/tmp}/garagetytus-folder-sync.lock"
+REMOTE_PATH_OVERRIDE=""
+WORKDIR_OVERRIDE=""
+TIMEOUT_SEC=300
+RESYNC_TIMEOUT_SEC=7200
+COOLDOWN_SEC=600
+FORCE=0
+LOCAL_PATH=""
+BUCKET=""
+
+# Shared folders are meant to move user/project files, not dependency caches,
+# virtualenvs, git object stores, or local secrets. Those trees routinely turn a
+# small folder into 10k+ tiny transfers and make first sync look "stuck".
+# Set GARAGETYTUS_SYNC_ALL=1 only for an explicit full mirror.
+DEFAULT_EXCLUDES=(
+    ".DS_Store"
+    "**/.DS_Store"
+    ".git/**"
+    "**/.git/**"
+    "node_modules/**"
+    "**/node_modules/**"
+    ".venv/**"
+    "**/.venv/**"
+    "venv/**"
+    "**/venv/**"
+    "__pycache__/**"
+    "**/__pycache__/**"
+    ".pytest_cache/**"
+    "**/.pytest_cache/**"
+    ".mypy_cache/**"
+    "**/.mypy_cache/**"
+    ".ruff_cache/**"
+    "**/.ruff_cache/**"
+    ".cache/**"
+    "**/.cache/**"
+    ".env"
+    ".env.*"
+    "**/.env"
+    "**/.env.*"
+)
+
+err() { printf 'folder-sync: %s\n' "$*" >&2; exit 1; }
+note() { printf 'folder-sync: %s\n' "$*" >&2; }
+usage() { sed -n '1,12p' "$0" | sed 's|^# \{0,1\}||'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --rclone-conf) RCLONE_CONF="$2"; shift 2;;
+        --remote) RCLONE_REMOTE="$2"; shift 2;;
+        --remote-path) REMOTE_PATH_OVERRIDE="$2"; shift 2;;
+        --workdir) WORKDIR_OVERRIDE="$2"; shift 2;;
+        --timeout) TIMEOUT_SEC="$2"; shift 2;;
+        --resync-timeout) RESYNC_TIMEOUT_SEC="$2"; shift 2;;
+        --cooldown) COOLDOWN_SEC="$2"; shift 2;;
+        --force) FORCE=1; shift;;
+        -h|--help) usage; exit 0;;
+        -*) err "unknown flag: $1 (try --help)";;
+        *)
+            if [[ -z "$LOCAL_PATH" ]]; then LOCAL_PATH="$1"
+            elif [[ -z "$BUCKET" ]]; then BUCKET="$1"
+            else err "unexpected positional: $1"; fi
+            shift;;
+    esac
+done
+
+[[ -n "$LOCAL_PATH" ]] || err "missing local path"
+[[ -n "$BUCKET" ]] || err "missing bucket"
+case "$LOCAL_PATH" in
+    /*) ;;
+    ~*) LOCAL_PATH="${LOCAL_PATH/#\~/$HOME}";;
+    *) LOCAL_PATH="$(pwd)/${LOCAL_PATH}";;
+esac
+[[ -d "$LOCAL_PATH" ]] || err "local path not found: ${LOCAL_PATH}"
+[[ "$BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || err "invalid bucket: ${BUCKET}"
+[[ -f "$RCLONE_CONF" ]] || err "missing rclone config: ${RCLONE_CONF}"
+
+base=$(basename "${LOCAL_PATH%/}")
+[[ -n "$base" ]] || base="$BUCKET"
+SAFE_NAME=$(printf '%s-%s' "$BUCKET" "$base" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9.-]+/-/g')
+WORKDIR="${WORKDIR_OVERRIDE:-${WORKDIR_BASE}/${SAFE_NAME}}"
+if [[ -n "$REMOTE_PATH_OVERRIDE" ]]; then
+    if [[ "$REMOTE_PATH_OVERRIDE" == *:* ]]; then
+        REMOTE_PATH="$REMOTE_PATH_OVERRIDE"
+    else
+        REMOTE_PATH="${RCLONE_REMOTE}:${REMOTE_PATH_OVERRIDE}"
+    fi
+else
+    REMOTE_PATH="${RCLONE_REMOTE}:${BUCKET}"
+fi
+mkdir -p "$WORKDIR" "$LOCAL_PATH"
+
+# Keep empty folders from poisoning bisync's initial local listing.
+MARKER_FILE="${LOCAL_PATH}/.garagetytus-bound"
+if [[ ! -f "$MARKER_FILE" ]]; then
+    cat > "$MARKER_FILE" <<MEOF
+This folder is bound to s3://${BUCKET} via garagetytus.
+Bound at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+Bound by: $(whoami)@$(hostname -s)
+Do not delete this marker — bisync uses it to track folder identity.
+MEOF
+fi
+
+has_baseline() {
+    find "$WORKDIR" -maxdepth 1 -name '*.path1.lst' -size +0c 2>/dev/null | grep -q . && \
+    find "$WORKDIR" -maxdepth 1 -name '*.path2.lst' -size +0c 2>/dev/null | grep -q .
+}
+
+clear_stale_locks() {
+    local lock pid active=0
+    for lock in "$WORKDIR"/*.lck; do
+        [[ -e "$lock" ]] || continue
+        pid="$(sed -n 's/.*"PID":"\{0,1\}\([0-9][0-9]*\)"\{0,1\}.*/\1/p' "$lock" | head -n 1)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            note "active rclone lock kept: ${lock} (pid=${pid})"
+            active=1
+            continue
+        fi
+        note "removing stale rclone lock: ${lock}"
+        rm -f "$lock"
+    done
+    if [[ "$active" -eq 1 ]]; then
+        note "active rclone lock present; skipping this tick"
+        exit 0
+    fi
+}
+
+clear_stale_locks
+
+skip_recent_automatic_incremental() {
+    [[ "$FORCE" -eq 1 ]] && return 0
+    has_baseline || return 0
+    [[ "$COOLDOWN_SEC" =~ ^[0-9]+$ ]] || COOLDOWN_SEC=600
+    local marker now last age
+    marker="${WORKDIR}/.last-attempt"
+    [[ -f "$marker" ]] || return 0
+    now="$(date +%s)"
+    last="$(cat "$marker" 2>/dev/null || echo 0)"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    age=$((now - last))
+    if [[ "$age" -lt "$COOLDOWN_SEC" ]]; then
+        note "recent sync attempt ${age}s ago; skipping automatic tick (cooldown=${COOLDOWN_SEC}s)"
+        exit 0
+    fi
+}
+
+skip_recent_automatic_incremental
+
+acquire_global_sync_slot() {
+    [[ "${GARAGETYTUS_SYNC_PARALLEL:-0}" == "1" ]] && return 0
+    local pid
+    if mkdir "$GLOBAL_LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "${GLOBAL_LOCK_DIR}/pid"
+        trap 'rm -rf "$GLOBAL_LOCK_DIR"' EXIT INT TERM
+        return 0
+    fi
+    pid="$(cat "${GLOBAL_LOCK_DIR}/pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        note "another garagetytus sync is already running (pid=${pid}); skipping this tick"
+        exit 0
+    fi
+    rm -rf "$GLOBAL_LOCK_DIR"
+    if mkdir "$GLOBAL_LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "${GLOBAL_LOCK_DIR}/pid"
+        trap 'rm -rf "$GLOBAL_LOCK_DIR"' EXIT INT TERM
+        return 0
+    fi
+    note "another garagetytus sync acquired the slot; skipping this tick"
+    exit 0
+}
+
+acquire_global_sync_slot
+
+date +%s > "${WORKDIR}/.last-attempt"
+
+RCLONE_FILTER_ARGS=()
+if [[ "${GARAGETYTUS_SYNC_ALL:-0}" != "1" ]]; then
+    for pattern in "${DEFAULT_EXCLUDES[@]}"; do
+        RCLONE_FILTER_ARGS+=(--exclude "$pattern")
+    done
+fi
+
+if has_baseline; then
+    note "incremental bisync: ${LOCAL_PATH} ↔ ${REMOTE_PATH}"
+    /usr/local/bin/timeout "$TIMEOUT_SEC" /usr/local/bin/rclone --config "$RCLONE_CONF" \
+        bisync "$LOCAL_PATH" "$REMOTE_PATH" \
+        --workdir "$WORKDIR" \
+        --max-lock 2m \
+        --conflict-resolve newer \
+        --resilient \
+        --stats 15s \
+        --stats-one-line \
+        --stats-log-level NOTICE \
+        "${RCLONE_FILTER_ARGS[@]}"
+else
+    note "initial bisync --resync: ${LOCAL_PATH} ↔ ${REMOTE_PATH}"
+    /usr/local/bin/timeout "$RESYNC_TIMEOUT_SEC" /usr/local/bin/rclone --config "$RCLONE_CONF" \
+        bisync "$LOCAL_PATH" "$REMOTE_PATH" \
+        --workdir "$WORKDIR" \
+        --resync \
+        --stats 15s \
+        --stats-one-line \
+        --stats-log-level NOTICE \
+        --max-lock 2m \
+        "${RCLONE_FILTER_ARGS[@]}"
+fi

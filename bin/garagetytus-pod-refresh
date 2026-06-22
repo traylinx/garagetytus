@@ -186,6 +186,15 @@ for bucket in "${buckets[@]}"; do
         | jq -r --arg b "$bucket" '.buckets[] | select(.name==$b) | .purpose // ""')
     is_default=$(printf '%s' "$existing" \
         | jq -r --arg b "$bucket" '.buckets[] | select(.name==$b) | .default // false')
+    folder_id=$(printf '%s' "$existing" \
+        | jq -r --arg b "$bucket" '.buckets[] | select(.name==$b) | .folder_id // ""')
+    folder_slug=$(printf '%s' "$existing" \
+        | jq -r --arg b "$bucket" '.buckets[] | select(.name==$b) | .folder_slug // .slug // $b')
+    workspace_path=$(printf '%s' "$existing" \
+        | jq -r --arg b "$bucket" --arg slug "$folder_slug" '.buckets[] | select(.name==$b) | .workspace_path // ("/app/workspace/shared/" + $slug)')
+    sync_layout=$(printf '%s' "$existing" \
+        | jq -r --arg b "$bucket" '.buckets[] | select(.name==$b) | .sync_layout // "legacy_bucket_root"')
+    [[ -n "$folder_id" && "$folder_id" != "null" ]] || err "bucket ${bucket} missing folder_id; cannot refresh without broadening scope"
 
     fresh_blobs+=("$(jq -nc \
         --arg name "$bucket" \
@@ -194,11 +203,17 @@ for bucket in "${buckets[@]}"; do
         --arg gid "g_${POD_NUM}_${bucket}_$(date -u +%s)" \
         --arg exp "$(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)" \
         --arg purpose "$purpose" \
+        --arg folder_id "$folder_id" \
+        --arg folder_slug "$folder_slug" \
+        --arg workspace_path "$workspace_path" \
+        --arg sync_layout "$sync_layout" \
         --argjson default "$is_default" \
         '{name:$name, endpoint:$endpoint, region:"garage",
           access_key:$ak, secret_key:$sk, perms:"rw",
           grant_id:$gid, expires_at:$exp,
-          purpose:$purpose, default:$default}')")
+          purpose:$purpose, folder_id:$folder_id, folder_slug:$folder_slug,
+          sync_layout:$sync_layout, credential_mode:"static_bucket_guarded",
+          workspace_path:$workspace_path, default:$default}')")
     note "  rotated ${key_name} (new id=${ak})"
 done
 
