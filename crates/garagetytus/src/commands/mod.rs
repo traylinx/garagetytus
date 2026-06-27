@@ -5,6 +5,7 @@ pub mod cluster;
 pub mod install;
 pub mod metrics;
 pub mod start;
+pub mod sync;
 
 /// Strict duration grammar: `30m | 1h | 24h | 7d | permanent`.
 /// Returns `Ok(None)` for `permanent`. Carved verbatim from

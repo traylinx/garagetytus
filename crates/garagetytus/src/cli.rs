@@ -69,6 +69,56 @@ pub enum Cmd {
     /// mode, see `garagetytus cluster repair` for orchestrated
     /// per-node repair across the cluster.
     Repair,
+    /// Mac-client shared-folder sync maintenance (sprint 2026-06-26,
+    /// Phase 3): converge a stale ephemeral rclone endpoint to the
+    /// reallocation-stable address, and emit machine-readable
+    /// sync-health for the tytus-cli daemon + tytus-os UI.
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
+    },
+}
+
+/// `garagetytus sync *` — client-side endpoint convergence + sync-health.
+#[derive(Subcommand, Debug)]
+pub enum SyncCmd {
+    /// Self-heal the `[garagetytus]` rclone remote endpoint: rewrite a stale
+    /// ephemeral per-pod address (`http://10.<octet>.<n>.1:3900`, orphaned by
+    /// pod reallocation) to the stable `http://10.42.42.1:3900`. Section-aware
+    /// parse (never a blind regex), touches ONLY `[garagetytus]`, backs up +
+    /// atomic + idempotent. Safe to run on every daemon start / connect /
+    /// refresh; already-stable configs are a no-op.
+    HealEndpoint {
+        /// rclone config path (default: ~/.config/rclone/rclone.conf).
+        #[arg(long)]
+        config: Option<String>,
+        /// Stable target endpoint (default: http://10.42.42.1:3900).
+        #[arg(long)]
+        stable_endpoint: Option<String>,
+        /// Print the plan; make no changes.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit a JSON result envelope.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe the configured endpoint and write the schema-versioned
+    /// `mac-sync-health-v1` file (default: ~/.cache/garagetytus/sync-health.json)
+    /// the tytus-cli daemon reads and the tytus-os UI renders truthfully.
+    Health {
+        /// Output path (default: ~/.cache/garagetytus/sync-health.json).
+        #[arg(long)]
+        out: Option<String>,
+        /// rclone config path (default: ~/.config/rclone/rclone.conf).
+        #[arg(long)]
+        config: Option<String>,
+        /// Treat health older than this many seconds as stale (consumer hint).
+        #[arg(long, default_value_t = 300)]
+        stale_after_seconds: u64,
+        /// Also print the health JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `garagetytus cluster *` — Q4 verdict locked invocation

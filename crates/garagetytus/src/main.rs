@@ -10,7 +10,7 @@ mod context;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, ClusterCmd, Cmd};
+use cli::{Cli, ClusterCmd, Cmd, SyncCmd};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
@@ -63,6 +63,14 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Repair => commands::cluster::local_repair(&ctx),
+        Cmd::Sync { cmd } => match cmd {
+            SyncCmd::HealEndpoint { config, stable_endpoint, dry_run, json } => {
+                commands::sync::heal_endpoint(&ctx, config, stable_endpoint, dry_run, json)
+            }
+            SyncCmd::Health { out, config, stale_after_seconds, json } => {
+                commands::sync::health(&ctx, out, config, stale_after_seconds, json)
+            }
+        },
     }?;
 
     std::process::exit(exit_code);
