@@ -33,6 +33,22 @@ DEFAULT_EXCLUDES=(
     "**/.venv/**"
     "venv/**"
     "**/venv/**"
+    # Build / dependency / IaC trees — mirror the pod-side upload floor
+    # (contract shared-folder-upload-exclude-v1) so Mac↔pod exclusion is
+    # symmetric. A bound Rust/Go/Terraform/packaged project otherwise pushes
+    # 10k+ generated artifacts and the first sync looks frozen.
+    "site-packages/**"
+    "**/site-packages/**"
+    "target/**"
+    "**/target/**"
+    "dist/**"
+    "**/dist/**"
+    "build/**"
+    "**/build/**"
+    "vendor/**"
+    "**/vendor/**"
+    ".terraform/**"
+    "**/.terraform/**"
     "__pycache__/**"
     "**/__pycache__/**"
     ".pytest_cache/**"

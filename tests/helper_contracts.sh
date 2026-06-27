@@ -62,6 +62,14 @@ grep -F -- '--conflict-resolve newer' "$ROOT/bin/garagetytus-folder-sync" >/dev/
 grep -F 'DEFAULT_EXCLUDES=(' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
 grep -F '"**/node_modules/**"' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
 grep -F '"**/venv/**"' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
+# Mac↔pod exclusion symmetry: the build/dep/IaC floor must match the pod-side
+# contract shared-folder-upload-exclude-v1 (target/dist/build/vendor/.terraform/
+# site-packages). A Rust/Terraform project bound as a shared folder otherwise
+# pushes 10k+ generated artifacts and the first sync looks frozen.
+grep -F '"**/target/**"' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
+grep -F '"**/.terraform/**"' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
+grep -F '"**/target/**"' "$ROOT/bin/garagetytus-folder-bind" >/dev/null
+grep -F '"**/.terraform/**"' "$ROOT/bin/garagetytus-folder-bind" >/dev/null
 grep -F 'GARAGETYTUS_SYNC_ALL' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
 grep -F 'RCLONE_FILTER_ARGS+=(--exclude "$pattern")' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
 grep -F 'clear_stale_locks' "$ROOT/bin/garagetytus-folder-sync" >/dev/null
